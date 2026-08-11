@@ -44,6 +44,7 @@ pub enum Preset {
     LrHqae,
     MapIclr,
     Sr,
+    StrainxpressSrAva,
     Splice,
     SpliceHq,
     SpliceSr,
@@ -66,6 +67,7 @@ impl Preset {
             Preset::LrHqae => "lr:hqae",
             Preset::MapIclr => "map-iclr",
             Preset::Sr => "sr",
+            Preset::StrainxpressSrAva => "strainxpress-sr-ava",
             Preset::Splice => "splice",
             Preset::SpliceHq => "splice:hq",
             Preset::SpliceSr => "splice:sr",
@@ -792,6 +794,25 @@ pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_h
             opt.scoring.mismatch_penalty = 6; opt.scoring.transition = 4;
             opt.scoring.gap_open = 10; opt.scoring.gap_open2 = 50;
         },
+        "strainxpress-sr-ava" => {
+            *k = 21;
+            *w = 11;
+            *is_hpc = false;
+            opt.flags.insert(
+                AlignFlags::SHORT_READ
+                    | AlignFlags::NO_DIAG
+                    | AlignFlags::ALL_CHAINS
+                    | AlignFlags::NO_DUAL
+                    | AlignFlags::NO_LJOIN,
+            );
+            opt.chaining.bandwidth = 0;
+            opt.chaining.min_chain_score = 30;
+            opt.chaining.min_cnt = 2;
+            opt.alignment.min_dp_max = 60;
+            opt.scoring.match_score = 4;
+            opt.scoring.mismatch_penalty = 2;
+            opt.alignment.end_bonus = 100;
+        },
         p if p.starts_with("asm") => {
             *k = 19; *w = 19;
             opt.chaining.bandwidth = 1000; opt.chaining.bandwidth_long = 100000;
@@ -1497,6 +1518,7 @@ mod tests {
     fn test_preset_as_str_roundtrip() {
         let presets = [
             Preset::MapOnt, Preset::MapPb, Preset::MapHifi, Preset::Sr,
+            Preset::StrainxpressSrAva,
             Preset::Splice, Preset::Asm5, Preset::AvaOnt,
         ];
         for p in &presets {
@@ -1513,6 +1535,32 @@ mod tests {
         assert_eq!(k, 21);
         assert_eq!(w, 11);
         assert!(opt.flags.contains(AlignFlags::SHORT_READ));
+    }
+
+    #[test]
+    fn test_apply_preset_strainxpress_sr_ava_contract() {
+        let mut opt = MapOptions::default();
+        let mut k = 15;
+        let mut w = 10;
+        let mut is_hpc = false;
+        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, "strainxpress-sr-ava")
+            .unwrap();
+        assert_eq!((k, w, is_hpc), (21, 11, false));
+        assert_eq!(
+            opt.flags,
+            AlignFlags::SHORT_READ
+                | AlignFlags::NO_DIAG
+                | AlignFlags::ALL_CHAINS
+                | AlignFlags::NO_DUAL
+                | AlignFlags::NO_LJOIN
+        );
+        assert_eq!(opt.chaining.bandwidth, 0);
+        assert_eq!(opt.chaining.min_chain_score, 30);
+        assert_eq!(opt.chaining.min_cnt, 2);
+        assert_eq!(opt.alignment.min_dp_max, 60);
+        assert_eq!(opt.scoring.match_score, 4);
+        assert_eq!(opt.scoring.mismatch_penalty, 2);
+        assert_eq!(opt.alignment.end_bonus, 100);
     }
 
     #[test]
