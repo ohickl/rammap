@@ -7,19 +7,19 @@
 
 use super::extend::AlignmentContext;
 use super::index::{Index, TargetSequence};
-use super::map::{map_query, MapContext, MapOptions};
+use super::map::{MapContext, MapOptions, map_query};
 use super::occurrence_sidecar::{
     OccurrenceRecord, OccurrenceSidecarMetadata, OccurrenceSidecarReader, OccurrenceSidecarWriter,
 };
 use super::pipeline::{
-    align_query_raw, finalize_raw_query, format_output, MapResult, OutputConfig, RawQuery, ReadInfo,
+    MapResult, OutputConfig, RawQuery, ReadInfo, align_query_raw, finalize_raw_query, format_output,
 };
 use super::raw_spool::{RawSpoolMetadata, RawSpoolReader, RawSpoolWriter};
 use crate::fasta;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_CALIBRATION_BINS: usize = 16 * 1024 * 1024;
@@ -32,6 +32,8 @@ const STAGE_OUTPUT_READY: u8 = 3;
 const STAGE_COMPLETE: u8 = 4;
 const FNV_OFFSET: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
+const INDEX_ARTIFACT_MAGIC: &[u8; 4] = b"RXIX";
+const INDEX_ARTIFACT_VERSION: u32 = 1;
 
 /// Inputs and immutable parameters for one native partitioned run.
 pub struct PartitionedMapConfig {
@@ -71,6 +73,52 @@ fn checksum_update(mut state: u64, bytes: &[u8]) -> u64 {
         state = state.wrapping_mul(FNV_PRIME);
     }
     state
+}
+
+struct ChecksumWriter<'a> {
+    writer: &'a mut File,
+    checksum: u64,
+    bytes: u64,
+}
+
+impl Write for ChecksumWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.writer.write(bytes)?;
+        self.checksum = checksum_update(self.checksum, &bytes[..written]);
+        self.bytes = self
+            .bytes
+            .checked_add(written as u64)
+            .ok_or_else(|| invalid("partitioned index payload length overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+struct ChecksumReader<R> {
+    reader: R,
+    checksum: u64,
+    bytes: u64,
+}
+
+impl<R: Read> Read for ChecksumReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let read = self.reader.read(bytes)?;
+        self.checksum = checksum_update(self.checksum, &bytes[..read]);
+        self.bytes = self
+            .bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| invalid("partitioned index payload length overflow"))?;
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for ChecksumReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.reader.seek(position)
+    }
 }
 
 fn create_new(path: &Path) -> io::Result<File> {
@@ -113,6 +161,10 @@ fn sidecar_path(config: &PartitionedMapConfig, shard_id: u32) -> PathBuf {
 
 fn raw_path(config: &PartitionedMapConfig, shard_id: u32) -> PathBuf {
     config.spool_dir.join(format!("raw-{shard_id:08}.rxrs"))
+}
+
+fn index_path(config: &PartitionedMapConfig, shard_id: u32) -> PathBuf {
+    config.spool_dir.join(format!("index-{shard_id:08}.rxix"))
 }
 
 fn partial_path(path: &Path) -> PathBuf {
@@ -168,10 +220,14 @@ impl PartitionManifest {
             return Err(invalid("partitioned resume manifest has no mid_occ"));
         }
         if self.stage >= STAGE_RAW && self.completed_raw != shard_count {
-            return Err(invalid("partitioned resume manifest raw stage is incomplete"));
+            return Err(invalid(
+                "partitioned resume manifest raw stage is incomplete",
+            ));
         }
         if self.stage >= STAGE_OUTPUT_READY && self.output_checksum == 0 {
-            return Err(invalid("partitioned resume manifest output facts are invalid"));
+            return Err(invalid(
+                "partitioned resume manifest output facts are invalid",
+            ));
         }
         Ok(())
     }
@@ -209,11 +265,15 @@ fn take_bytes<'a>(bytes: &'a [u8], offset: &mut usize, count: usize) -> io::Resu
 }
 
 fn take_u32(bytes: &[u8], offset: &mut usize) -> io::Result<u32> {
-    Ok(u32::from_le_bytes(take_bytes(bytes, offset, 4)?.try_into().unwrap()))
+    Ok(u32::from_le_bytes(
+        take_bytes(bytes, offset, 4)?.try_into().unwrap(),
+    ))
 }
 
 fn take_u64(bytes: &[u8], offset: &mut usize) -> io::Result<u64> {
-    Ok(u64::from_le_bytes(take_bytes(bytes, offset, 8)?.try_into().unwrap()))
+    Ok(u64::from_le_bytes(
+        take_bytes(bytes, offset, 8)?.try_into().unwrap(),
+    ))
 }
 
 fn load_manifest(path: &Path) -> io::Result<PartitionManifest> {
@@ -231,7 +291,9 @@ fn load_manifest(path: &Path) -> io::Result<PartitionManifest> {
     }
     let mut offset = 4;
     if take_u32(&bytes, &mut offset)? != PARTITION_MANIFEST_VERSION {
-        return Err(invalid("partitioned resume manifest version is unsupported"));
+        return Err(invalid(
+            "partitioned resume manifest version is unsupported",
+        ));
     }
     let shard_count = take_u32(&bytes, &mut offset)?;
     let stage = take_bytes(&bytes, &mut offset, 1)?[0];
@@ -263,13 +325,136 @@ fn load_manifest(path: &Path) -> io::Result<PartitionManifest> {
 fn write_manifest(path: &Path, manifest: PartitionManifest) -> io::Result<()> {
     let temporary = partial_path(path);
     if temporary.exists() {
-        return Err(invalid("partitioned resume manifest has an uncommitted temporary file"));
+        return Err(invalid(
+            "partitioned resume manifest has an uncommitted temporary file",
+        ));
     }
     let mut file = create_new(&temporary)?;
     file.write_all(&encode_manifest(manifest))?;
     file.sync_all()?;
     fs::rename(temporary, path)?;
     Ok(())
+}
+
+fn write_index_artifact(
+    config: &PartitionedMapConfig,
+    shard_id: u32,
+    shard_count: u32,
+    index: &Index,
+) -> io::Result<()> {
+    let path = index_path(config, shard_id);
+    if path.exists() {
+        return Err(invalid(
+            "partitioned index artifact exists before its manifest stage",
+        ));
+    }
+    let temporary = partial_path(&path);
+    if temporary.exists() {
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = create_new(&temporary)?;
+    file.write_all(INDEX_ARTIFACT_MAGIC)?;
+    file.write_all(&INDEX_ARTIFACT_VERSION.to_le_bytes())?;
+    file.write_all(&shard_id.to_le_bytes())?;
+    file.write_all(&shard_count.to_le_bytes())?;
+    file.write_all(&(config.k as u64).to_le_bytes())?;
+    file.write_all(&(config.w as u64).to_le_bytes())?;
+    file.write_all(&[u8::from(config.is_hpc)])?;
+    file.write_all(&(config.index_max_occ as u64).to_le_bytes())?;
+    file.write_all(&config.parameter_digest)?;
+    file.write_all(&config.target_digest)?;
+    let (payload_bytes, payload_checksum) = {
+        let mut payload = ChecksumWriter {
+            writer: &mut file,
+            checksum: FNV_OFFSET,
+            bytes: 0,
+        };
+        index.save_part(&mut payload)?;
+        payload.flush()?;
+        (payload.bytes, payload.checksum)
+    };
+    file.write_all(&payload_bytes.to_le_bytes())?;
+    file.write_all(&payload_checksum.to_le_bytes())?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn read_u64_field<R: Read>(reader: &mut R) -> io::Result<u64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u32_field<R: Read>(reader: &mut R) -> io::Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn load_index_artifact(
+    config: &PartitionedMapConfig,
+    shard_id: u32,
+    shard_count: u32,
+) -> io::Result<Index> {
+    let path = index_path(config, shard_id);
+    let file = File::open(&path)?;
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != INDEX_ARTIFACT_MAGIC {
+        return Err(invalid("partitioned index artifact magic is invalid"));
+    }
+    if read_u32_field(&mut reader)? != INDEX_ARTIFACT_VERSION
+        || read_u32_field(&mut reader)? != shard_id
+        || read_u32_field(&mut reader)? != shard_count
+        || read_u64_field(&mut reader)? != config.k as u64
+        || read_u64_field(&mut reader)? != config.w as u64
+    {
+        return Err(invalid("partitioned index artifact identity is invalid"));
+    }
+    let mut hpc = [0u8; 1];
+    reader.read_exact(&mut hpc)?;
+    if hpc[0] != u8::from(config.is_hpc)
+        || read_u64_field(&mut reader)? != config.index_max_occ as u64
+    {
+        return Err(invalid("partitioned index artifact parameters are invalid"));
+    }
+    let mut parameter_digest = [0u8; 32];
+    let mut target_digest = [0u8; 32];
+    reader.read_exact(&mut parameter_digest)?;
+    reader.read_exact(&mut target_digest)?;
+    if parameter_digest != config.parameter_digest || target_digest != config.target_digest {
+        return Err(invalid(
+            "partitioned index artifact digest identity mismatch",
+        ));
+    }
+
+    let mut payload = ChecksumReader {
+        reader,
+        checksum: FNV_OFFSET,
+        bytes: 0,
+    };
+    let index = Index::load_part(&mut payload)?
+        .ok_or_else(|| invalid("partitioned index artifact payload is empty"))?;
+    let payload_bytes = read_u64_field(&mut payload.reader)?;
+    let payload_checksum = read_u64_field(&mut payload.reader)?;
+    if payload.bytes != payload_bytes || payload.checksum != payload_checksum {
+        return Err(invalid("partitioned index artifact checksum is invalid"));
+    }
+    let mut trailing = [0u8; 1];
+    if payload.reader.read(&mut trailing)? != 0 {
+        return Err(invalid("partitioned index artifact has trailing bytes"));
+    }
+    if index.kmer_size != config.k
+        || index.window_size != config.w
+        || index.homopolymer_compressed != config.is_hpc
+    {
+        return Err(invalid(
+            "partitioned index artifact index parameters are invalid",
+        ));
+    }
+    Ok(index)
 }
 
 fn validate_config(config: &PartitionedMapConfig) -> io::Result<()> {
@@ -295,20 +480,16 @@ fn validate_config(config: &PartitionedMapConfig) -> io::Result<()> {
     Ok(())
 }
 
-fn build_occurrence_sidecars(
-    config: &PartitionedMapConfig,
-) -> io::Result<(Vec<TargetSequence>, Vec<usize>)> {
+fn build_occurrence_sidecars(config: &PartitionedMapConfig) -> io::Result<()> {
     let shard_count =
         u32::try_from(config.target_paths.len()).map_err(|_| invalid("too many target shards"))?;
-    let mut all_seqs = Vec::new();
-    let mut offsets = Vec::with_capacity(config.target_paths.len());
-    let mut next_ref_id = 0usize;
-    let mut next_offset = 0u64;
 
     for (shard_id, target_path) in config.target_paths.iter().enumerate() {
         let sidecar = sidecar_path(config, shard_id as u32);
         if sidecar.exists() {
-            return Err(invalid("partitioned occurrence sidecar exists before its manifest stage"));
+            return Err(invalid(
+                "partitioned occurrence sidecar exists before its manifest stage",
+            ));
         }
         let temporary = partial_path(&sidecar);
         if temporary.exists() {
@@ -343,66 +524,15 @@ fn build_occurrence_sidecars(
         if let Some(error) = sidecar_error {
             return Err(error);
         }
+        write_index_artifact(config, shard_id as u32, shard_count, &index)?;
         let buffered = writer.finish()?;
         buffered
             .into_inner()
             .map_err(|error| io::Error::other(error.to_string()))?
             .sync_all()?;
         fs::rename(temporary, sidecar)?;
-
-        offsets.push(next_ref_id);
-        for mut seq in index.seqs.iter().cloned() {
-            seq.offset = seq
-                .offset
-                .checked_add(next_offset)
-                .ok_or_else(|| invalid("target offset overflow"))?;
-            all_seqs.push(seq);
-            next_ref_id = next_ref_id
-                .checked_add(1)
-                .ok_or_else(|| invalid("target identifier overflow"))?;
-        }
-        next_offset = next_offset
-            .checked_add(index.seqs.iter().map(|s| s.len as u64).sum())
-            .ok_or_else(|| invalid("target length overflow"))?;
     }
-    Ok((all_seqs, offsets))
-}
-
-fn read_target_metadata(config: &PartitionedMapConfig) -> io::Result<(Vec<TargetSequence>, Vec<usize>)> {
-    let mut all_seqs = Vec::new();
-    let mut offsets = Vec::with_capacity(config.target_paths.len());
-    let mut next_ref_id = 0usize;
-    let mut next_offset = 0u64;
-    for target_path in &config.target_paths {
-        let mut reader = fasta::open(
-            target_path
-                .to_str()
-                .ok_or_else(|| invalid("target path is not UTF-8"))?,
-        )?;
-        offsets.push(next_ref_id);
-        while let Some(record) = reader.read_next().map_err(io::Error::other)? {
-            let name = record
-                .name()
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            let len = record.sequence().len();
-            all_seqs.push(TargetSequence {
-                name,
-                len,
-                offset: next_offset,
-                is_alt: false,
-            });
-            next_ref_id = next_ref_id
-                .checked_add(1)
-                .ok_or_else(|| invalid("target identifier overflow"))?;
-            next_offset = next_offset
-                .checked_add(len as u64)
-                .ok_or_else(|| invalid("target offset overflow"))?;
-        }
-    }
-    Ok((all_seqs, offsets))
+    Ok(())
 }
 
 fn validate_sidecars(config: &PartitionedMapConfig, shard_count: u32) -> io::Result<()> {
@@ -535,23 +665,17 @@ fn map_shard_to_raw(
     shard_id: u32,
     shard_count: u32,
     mid_occ: usize,
-) -> io::Result<u64> {
-    let target_path = config.target_paths[shard_id as usize]
-        .to_str()
-        .ok_or_else(|| invalid("target path is not UTF-8"))?;
-    let index = Index::build_fasta(
-        target_path,
-        config.w,
-        config.k,
-        config.is_hpc,
-        config.index_max_occ,
-    )?;
+) -> io::Result<(u64, Vec<TargetSequence>)> {
+    let index = load_index_artifact(config, shard_id, shard_count)?;
+    let target_metadata = index.seqs.clone();
     let mut options = config.options.clone();
     options.seeding.mid_occ = mid_occ;
     super::super::api::finalize_options(&mut options, config.k);
     let raw = raw_path(config, shard_id);
     if raw.exists() {
-        return Err(invalid("partitioned raw spool exists before its manifest stage"));
+        return Err(invalid(
+            "partitioned raw spool exists before its manifest stage",
+        ));
     }
     let temporary = partial_path(&raw);
     if temporary.exists() {
@@ -616,7 +740,27 @@ fn map_shard_to_raw(
         .map_err(|error| io::Error::other(error.to_string()))?
         .sync_all()?;
     fs::rename(temporary, raw)?;
-    Ok(ordinal)
+    Ok((ordinal, target_metadata))
+}
+
+fn append_target_metadata(
+    all_seqs: &mut Vec<TargetSequence>,
+    ref_offsets: &mut Vec<usize>,
+    next_offset: &mut u64,
+    shard_seqs: Vec<TargetSequence>,
+) -> io::Result<()> {
+    ref_offsets.push(all_seqs.len());
+    for mut seq in shard_seqs {
+        seq.offset = seq
+            .offset
+            .checked_add(*next_offset)
+            .ok_or_else(|| invalid("target offset overflow"))?;
+        *next_offset = (*next_offset)
+            .checked_add(seq.len as u64)
+            .ok_or_else(|| invalid("target length overflow"))?;
+        all_seqs.push(seq);
+    }
+    Ok(())
 }
 
 fn merge_to_partial(
@@ -733,11 +877,15 @@ fn merge_to_partial(
 
 fn publish_partial_output(config: &PartitionedMapConfig, expected: (u64, u64)) -> io::Result<()> {
     if config.output_path.exists() {
-        return Err(invalid("refusing to replace an existing partitioned output"));
+        return Err(invalid(
+            "refusing to replace an existing partitioned output",
+        ));
     }
     let temporary = partial_path(&config.output_path);
     if output_stats(&temporary)? != expected {
-        return Err(invalid("partitioned temporary output facts do not match the manifest"));
+        return Err(invalid(
+            "partitioned temporary output facts do not match the manifest",
+        ));
     }
     fs::rename(temporary, &config.output_path)?;
     Ok(())
@@ -755,7 +903,9 @@ pub fn map_partitioned_fasta_to_paf(
     let manifest_file = manifest_path(config);
     let mut manifest = if config.resume {
         if partial_path(&manifest_file).exists() {
-            return Err(invalid("partitioned resume manifest has an uncommitted temporary file"));
+            return Err(invalid(
+                "partitioned resume manifest has an uncommitted temporary file",
+            ));
         }
         let manifest = load_manifest(&manifest_file)?;
         manifest.validate_config(config, shard_count)?;
@@ -777,7 +927,9 @@ pub fn map_partitioned_fasta_to_paf(
     if manifest.stage == STAGE_COMPLETE {
         let observed = output_stats(&config.output_path)?;
         if observed != (manifest.output_bytes, manifest.output_checksum) {
-            return Err(invalid("completed partitioned output does not match its manifest"));
+            return Err(invalid(
+                "completed partitioned output does not match its manifest",
+            ));
         }
         return Ok(PartitionedMapReceipt {
             shard_count,
@@ -791,7 +943,9 @@ pub fn map_partitioned_fasta_to_paf(
         let expected = (manifest.output_bytes, manifest.output_checksum);
         if config.output_path.exists() {
             if output_stats(&config.output_path)? != expected {
-                return Err(invalid("published partitioned output does not match its manifest"));
+                return Err(invalid(
+                    "published partitioned output does not match its manifest",
+                ));
             }
         } else {
             publish_partial_output(config, expected)?;
@@ -806,30 +960,68 @@ pub fn map_partitioned_fasta_to_paf(
         });
     }
 
-    let (all_seqs, ref_offsets) = if manifest.stage >= STAGE_SIDECARS {
+    if manifest.stage >= STAGE_SIDECARS {
         validate_sidecars(config, shard_count)?;
-        read_target_metadata(config)?
     } else {
-        let metadata = build_occurrence_sidecars(config)?;
+        build_occurrence_sidecars(config)?;
         let mid_occ = calibrated_mid_occ(config, shard_count)?;
         manifest.stage = STAGE_SIDECARS;
         manifest.mid_occ = mid_occ as u64;
         write_manifest(&manifest_file, manifest)?;
-        metadata
-    };
+    }
     let mid_occ = usize::try_from(manifest.mid_occ)
         .map_err(|_| invalid("partitioned resume mid_occ exceeds usize"))?;
+    let mut all_seqs = Vec::new();
+    let mut ref_offsets = Vec::with_capacity(shard_count as usize);
+    let mut next_offset = 0u64;
     let mut expected_queries = None;
     for shard_id in 0..shard_count {
         let query_count = if shard_id < manifest.completed_raw {
-            validate_raw_spool(config, shard_id, shard_count)?
+            if config.resume {
+                let query_count = validate_raw_spool(config, shard_id, shard_count)?;
+                let index = load_index_artifact(config, shard_id, shard_count)?;
+                append_target_metadata(
+                    &mut all_seqs,
+                    &mut ref_offsets,
+                    &mut next_offset,
+                    index.seqs,
+                )?;
+                query_count
+            } else {
+                // The previous raw spools were committed by this fresh
+                // invocation. Their metadata was retained when they were
+                // mapped, so reopening and validating them here would
+                // duplicate a full read before the merge pass.
+                manifest.query_count
+            }
         } else if raw_path(config, shard_id).exists() {
             // The raw spool may have been atomically committed immediately
             // before a manifest update was interrupted. Validate it and
             // advance the manifest rather than rebuilding an immutable stage.
-            validate_raw_spool(config, shard_id, shard_count)?
+            let query_count = validate_raw_spool(config, shard_id, shard_count)?;
+            let index = load_index_artifact(config, shard_id, shard_count)?;
+            append_target_metadata(
+                &mut all_seqs,
+                &mut ref_offsets,
+                &mut next_offset,
+                index.seqs,
+            )?;
+            manifest.completed_raw = shard_id + 1;
+            manifest.query_count = query_count;
+            if manifest.completed_raw == shard_count {
+                manifest.stage = STAGE_RAW;
+            }
+            write_manifest(&manifest_file, manifest)?;
+            query_count
         } else {
-            let query_count = map_shard_to_raw(config, shard_id, shard_count, mid_occ)?;
+            let (query_count, target_metadata) =
+                map_shard_to_raw(config, shard_id, shard_count, mid_occ)?;
+            append_target_metadata(
+                &mut all_seqs,
+                &mut ref_offsets,
+                &mut next_offset,
+                target_metadata,
+            )?;
             manifest.completed_raw = shard_id + 1;
             manifest.query_count = query_count;
             if manifest.completed_raw == shard_count {
@@ -850,12 +1042,16 @@ pub fn map_partitioned_fasta_to_paf(
         return Err(invalid("partitioned raw stage did not complete"));
     }
     if config.output_path.exists() {
-        return Err(invalid("partitioned output exists before publication stage"));
+        return Err(invalid(
+            "partitioned output exists before publication stage",
+        ));
     }
     let temporary_output = partial_path(&config.output_path);
     if temporary_output.exists() {
         if !config.resume {
-            return Err(invalid("partitioned output has an uncommitted temporary file"));
+            return Err(invalid(
+                "partitioned output has an uncommitted temporary file",
+            ));
         }
         fs::remove_file(&temporary_output)?;
     }
@@ -889,7 +1085,7 @@ pub fn map_partitioned_fasta_to_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::align::pipeline::{align_and_format_query, ReadInfo};
+    use crate::align::pipeline::{ReadInfo, align_and_format_query};
     use crate::api::{apply_preset_str, finalize_options};
     use std::time::{SystemTime, UNIX_EPOCH};
 
