@@ -621,8 +621,9 @@ fn to_map_result(
     mi: &Index,
     out: &OutputConfig,
 ) -> MapResult {
-    // Cache Arc<str> per target to avoid cloning the name for each alignment
-    let mut name_cache: Vec<Option<Arc<str>>> = vec![None; mi.seqs.len()];
+    // Cache only targets referenced by this query. A catalog-sized vector here
+    // made every result conversion allocate O(target-count) state.
+    let mut name_cache: HashMap<usize, Arc<str>> = HashMap::with_capacity(pq.results.len());
 
     let mappings = pq.results.iter().zip(pq.mapqs.iter()).map(|(r, &mapq)| {
         let cigar_str = if out.do_cigar && !r.cigar_str.is_empty() { Some(r.cigar_str.clone()) } else { None };
@@ -632,9 +633,7 @@ fn to_map_result(
             2 => Some(Strand::Reverse),
             _ => None,
         };
-        let target_name = name_cache[r.ref_id].get_or_insert_with(|| {
-            Arc::from(mi.seqs[r.ref_id].name.as_str())
-        }).clone();
+        let target_name = cached_target_name(&mut name_cache, mi, r.ref_id);
         Mapping {
             target_name,
             target_id: r.ref_id,
@@ -661,6 +660,17 @@ fn to_map_result(
         }
     }).collect();
     MapResult { mappings }
+}
+
+fn cached_target_name(
+    cache: &mut HashMap<usize, Arc<str>>,
+    index: &Index,
+    target_id: usize,
+) -> Arc<str> {
+    cache
+        .entry(target_id)
+        .or_insert_with(|| Arc::from(index.seqs[target_id].name.as_str()))
+        .clone()
 }
 
 /// Parse a CIGAR string like "10M2I5M3D8M" into structured CigarOps.
@@ -1567,6 +1577,23 @@ mod tests {
     fn test_map_result_empty() {
         let result = MapResult { mappings: Vec::new() };
         assert!(result.mappings.is_empty());
+    }
+
+    #[test]
+    fn test_target_name_cache_scales_with_query_targets() {
+        let targets = (0..1024)
+            .map(|index| (format!("target-{index}"), vec![b'A'; 32]))
+            .collect();
+        let index = Index::build(targets, 11, 21, false, usize::MAX);
+        let mut cache = HashMap::with_capacity(2);
+        let first = cached_target_name(&mut cache, &index, 17);
+        let repeated = cached_target_name(&mut cache, &index, 17);
+        let second = cached_target_name(&mut cache, &index, 512);
+
+        assert_eq!(cache.len(), 2);
+        assert!(Arc::ptr_eq(&first, &repeated));
+        assert_eq!(&*first, "target-17");
+        assert_eq!(&*second, "target-512");
     }
 
     #[test]
