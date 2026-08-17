@@ -25,14 +25,14 @@
 //! `Aligner` is `Send + Sync` — wrap it in `Arc<Aligner>` to share across threads.
 //! Each call to `map_seq`/`map_pair` allocates lightweight per-call buffers internally.
 
-use crate::align::extend::AlignmentContext;
-use crate::align::index::Index;
-use crate::align::junc::{self, JunctionDb};
-use crate::align::map::{AlignFlags, MapContext, MapOptions};
-use crate::align::pipeline::{self, OutputConfig, ReadInfo};
-use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use crate::align::index::Index;
+use crate::align::map::{MapOptions, MapContext, AlignFlags};
+use crate::align::extend::AlignmentContext;
+use crate::align::pipeline::{self, OutputConfig, ReadInfo};
+use crate::align::junc::{self, JunctionDb};
+use std::collections::HashMap;
 
 /// Alignment preset (selected via the `-x` flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,17 +100,7 @@ pub struct CigarOp {
 impl CigarOp {
     /// Operation type as a character (M, I, D, N, S, H, =, X).
     pub fn op_char(&self) -> char {
-        match self.op {
-            0 => 'M',
-            1 => 'I',
-            2 => 'D',
-            3 => 'N',
-            4 => 'S',
-            5 => 'H',
-            7 => '=',
-            8 => 'X',
-            _ => '?',
-        }
+        match self.op { 0 => 'M', 1 => 'I', 2 => 'D', 3 => 'N', 4 => 'S', 5 => 'H', 7 => '=', 8 => 'X', _ => '?' }
     }
 }
 
@@ -217,11 +207,8 @@ pub fn finalize_options(opt: &mut MapOptions, k: usize) {
 /// set explicitly (by a preset or by the caller).
 pub fn calibrate_mid_occ(opt: &mut MapOptions, mi: &Index, mid_occ_frac: f32) {
     if opt.seeding.mid_occ == 0 {
-        opt.seeding.mid_occ = mi.cal_mid_occ(
-            mid_occ_frac,
-            opt.seeding.min_mid_occ,
-            opt.seeding.max_mid_occ,
-        );
+        opt.seeding.mid_occ =
+            mi.cal_mid_occ(mid_occ_frac, opt.seeding.min_mid_occ, opt.seeding.max_mid_occ);
     }
 }
 
@@ -274,59 +261,32 @@ impl AlignerBuilder {
     }
 
     /// k-mer size, in `1..=`[`MAX_KMER`]. Also scales the chaining gap penalty.
-    pub fn k(mut self, k: usize) -> Self {
-        self.k = Some(k);
-        self
-    }
+    pub fn k(mut self, k: usize) -> Self { self.k = Some(k); self }
 
     /// Minimizer window size. `1` indexes every k-mer.
-    pub fn w(mut self, w: usize) -> Self {
-        self.w = Some(w);
-        self
-    }
+    pub fn w(mut self, w: usize) -> Self { self.w = Some(w); self }
 
     /// Homopolymer-compressed seeding.
-    pub fn hpc(mut self, hpc: bool) -> Self {
-        self.hpc = Some(hpc);
-        self
-    }
+    pub fn hpc(mut self, hpc: bool) -> Self { self.hpc = Some(hpc); self }
 
     /// Occurrence cap applied while building the index (default: uncapped).
-    pub fn index_max_occ(mut self, max_occ: usize) -> Self {
-        self.index_max_occ = max_occ;
-        self
-    }
+    pub fn index_max_occ(mut self, max_occ: usize) -> Self { self.index_max_occ = max_occ; self }
 
     /// Seed occurrence threshold. Setting this skips calibration from the index.
-    pub fn mid_occ(mut self, mid_occ: usize) -> Self {
-        self.mid_occ = Some(mid_occ);
-        self
-    }
+    pub fn mid_occ(mut self, mid_occ: usize) -> Self { self.mid_occ = Some(mid_occ); self }
 
     /// Fraction of the most repetitive minimizers to filter when calibrating
     /// `mid_occ` (default: 2e-4).
-    pub fn mid_occ_frac(mut self, frac: f32) -> Self {
-        self.mid_occ_frac = frac;
-        self
-    }
+    pub fn mid_occ_frac(mut self, frac: f32) -> Self { self.mid_occ_frac = frac; self }
 
     /// Floor for the calibrated `mid_occ`.
-    pub fn min_mid_occ(mut self, min_mid_occ: i32) -> Self {
-        self.min_mid_occ = Some(min_mid_occ);
-        self
-    }
+    pub fn min_mid_occ(mut self, min_mid_occ: i32) -> Self { self.min_mid_occ = Some(min_mid_occ); self }
 
     /// Ceiling for the calibrated `mid_occ`.
-    pub fn max_mid_occ(mut self, max_mid_occ: i32) -> Self {
-        self.max_mid_occ = Some(max_mid_occ);
-        self
-    }
+    pub fn max_mid_occ(mut self, max_mid_occ: i32) -> Self { self.max_mid_occ = Some(max_mid_occ); self }
 
     /// Produce CIGAR strings (default: true).
-    pub fn cigar(mut self, cigar: bool) -> Self {
-        self.cigar = cigar;
-        self
-    }
+    pub fn cigar(mut self, cigar: bool) -> Self { self.cigar = cigar; self }
 
     /// Build the index from a FASTA reference file.
     pub fn from_fasta(self, path: &str) -> io::Result<Aligner> {
@@ -363,29 +323,15 @@ impl AlignerBuilder {
     /// fixed, so any `k`, `w`, or `hpc` set here must agree with the stored values.
     fn from_loaded_index(self, index: Index) -> io::Result<Aligner> {
         let (opt, _, _, _) = self.resolve()?;
-        if let Some(k) = self.k
-            && k != index.kmer_size
-        {
-            return Err(invalid(format!(
-                "k={} does not match index k={}",
-                k, index.kmer_size
-            )));
+        if let Some(k) = self.k && k != index.kmer_size {
+            return Err(invalid(format!("k={} does not match index k={}", k, index.kmer_size)));
         }
-        if let Some(w) = self.w
-            && w != index.window_size
-        {
-            return Err(invalid(format!(
-                "w={} does not match index w={}",
-                w, index.window_size
-            )));
+        if let Some(w) = self.w && w != index.window_size {
+            return Err(invalid(format!("w={} does not match index w={}", w, index.window_size)));
         }
-        if let Some(hpc) = self.hpc
-            && hpc != index.homopolymer_compressed
-        {
+        if let Some(hpc) = self.hpc && hpc != index.homopolymer_compressed {
             return Err(invalid(format!(
-                "hpc={} does not match index hpc={}",
-                hpc, index.homopolymer_compressed
-            )));
+                "hpc={} does not match index hpc={}", hpc, index.homopolymer_compressed)));
         }
         Ok(self.finish(opt, index))
     }
@@ -409,26 +355,16 @@ impl AlignerBuilder {
             return Err(invalid("w must be at least 1".to_string()));
         }
         if !(0.0..1.0).contains(&self.mid_occ_frac) {
-            return Err(invalid(format!(
-                "mid_occ_frac must be in [0, 1), got {}",
-                self.mid_occ_frac
-            )));
+            return Err(invalid(format!("mid_occ_frac must be in [0, 1), got {}", self.mid_occ_frac)));
         }
 
-        if let Some(v) = self.mid_occ {
-            opt.seeding.mid_occ = v;
-        }
-        if let Some(v) = self.min_mid_occ {
-            opt.seeding.min_mid_occ = v;
-        }
-        if let Some(v) = self.max_mid_occ {
-            opt.seeding.max_mid_occ = v;
-        }
+        if let Some(v) = self.mid_occ { opt.seeding.mid_occ = v; }
+        if let Some(v) = self.min_mid_occ { opt.seeding.min_mid_occ = v; }
+        if let Some(v) = self.max_mid_occ { opt.seeding.max_mid_occ = v; }
         if opt.seeding.min_mid_occ > opt.seeding.max_mid_occ {
             return Err(invalid(format!(
                 "min_mid_occ ({}) exceeds max_mid_occ ({})",
-                opt.seeding.min_mid_occ, opt.seeding.max_mid_occ
-            )));
+                opt.seeding.min_mid_occ, opt.seeding.max_mid_occ)));
         }
         Ok((opt, k, w, hpc))
     }
@@ -442,22 +378,10 @@ impl AlignerBuilder {
             opt.flags.remove(AlignFlags::OUT_CIGAR);
         }
         let out_cfg = OutputConfig {
-            do_cigar: self.cigar,
-            do_cs: false,
-            cs_long: false,
-            do_md: false,
-            do_ds: false,
-            eqx: false,
-            output_sam: false,
-            rg_id: None,
-            split_mode: false,
+            do_cigar: self.cigar, do_cs: false, cs_long: false, do_md: false, do_ds: false,
+            eqx: false, output_sam: false, rg_id: None, split_mode: false,
         };
-        Aligner {
-            index,
-            options: opt,
-            out_cfg,
-            junc_db: None,
-        }
+        Aligner { index, options: opt, out_cfg, junc_db: None }
     }
 }
 
@@ -465,69 +389,37 @@ impl Aligner {
     // --- Preset convenience methods (minimap2-rs compatibility) ---
 
     /// ONT long read preset.
-    pub fn map_ont() -> Preset {
-        Preset::MapOnt
-    }
+    pub fn map_ont() -> Preset { Preset::MapOnt }
     /// PacBio CLR preset.
-    pub fn map_pb() -> Preset {
-        Preset::MapPb
-    }
+    pub fn map_pb() -> Preset { Preset::MapPb }
     /// PacBio HiFi preset.
-    pub fn map_hifi() -> Preset {
-        Preset::MapHifi
-    }
+    pub fn map_hifi() -> Preset { Preset::MapHifi }
     /// Long read high-quality preset.
-    pub fn lr_hq() -> Preset {
-        Preset::LrHq
-    }
+    pub fn lr_hq() -> Preset { Preset::LrHq }
     /// Long read HQ all-extension preset.
-    pub fn lr_hqae() -> Preset {
-        Preset::LrHqae
-    }
+    pub fn lr_hqae() -> Preset { Preset::LrHqae }
     /// ICLR preset.
-    pub fn map_iclr() -> Preset {
-        Preset::MapIclr
-    }
+    pub fn map_iclr() -> Preset { Preset::MapIclr }
     /// Short read preset.
-    pub fn sr() -> Preset {
-        Preset::Sr
-    }
+    pub fn sr() -> Preset { Preset::Sr }
     /// Splice (RNA) preset.
-    pub fn splice() -> Preset {
-        Preset::Splice
-    }
+    pub fn splice() -> Preset { Preset::Splice }
     /// Splice high-quality preset.
-    pub fn splice_hq() -> Preset {
-        Preset::SpliceHq
-    }
+    pub fn splice_hq() -> Preset { Preset::SpliceHq }
     /// Splice short-read preset.
-    pub fn splice_sr() -> Preset {
-        Preset::SpliceSr
-    }
+    pub fn splice_sr() -> Preset { Preset::SpliceSr }
     /// cDNA preset.
-    pub fn cdna() -> Preset {
-        Preset::Cdna
-    }
+    pub fn cdna() -> Preset { Preset::Cdna }
     /// Assembly 5% divergence preset.
-    pub fn asm5() -> Preset {
-        Preset::Asm5
-    }
+    pub fn asm5() -> Preset { Preset::Asm5 }
     /// Assembly 10% divergence preset.
-    pub fn asm10() -> Preset {
-        Preset::Asm10
-    }
+    pub fn asm10() -> Preset { Preset::Asm10 }
     /// Assembly 20% divergence preset.
-    pub fn asm20() -> Preset {
-        Preset::Asm20
-    }
+    pub fn asm20() -> Preset { Preset::Asm20 }
     /// All-vs-all ONT overlap preset.
-    pub fn ava_ont() -> Preset {
-        Preset::AvaOnt
-    }
+    pub fn ava_ont() -> Preset { Preset::AvaOnt }
     /// All-vs-all PacBio overlap preset.
-    pub fn ava_pb() -> Preset {
-        Preset::AvaPb
-    }
+    pub fn ava_pb() -> Preset { Preset::AvaPb }
 
     // --- Constructors ---
 
@@ -596,14 +488,8 @@ impl Aligner {
         let mut map_ctx = MapContext::new();
         let out = self.resolve_out_cfg(&opts);
         let pq = pipeline::process_query(
-            &self.options,
-            &self.index,
-            name,
-            seq,
-            &mut ctx,
-            &mut map_ctx,
-            self.junc_db.as_ref(),
-            &out,
+            &self.options, &self.index, name, seq,
+            &mut ctx, &mut map_ctx, self.junc_db.as_ref(), &out,
         );
         to_map_result(&pq, &self.index, &out)
     }
@@ -618,31 +504,11 @@ impl Aligner {
         let mut ctx = AlignmentContext::new();
         let mut map_ctx = MapContext::new();
         let out = self.resolve_out_cfg(&opts);
-        let read1 = ReadInfo {
-            qname: name,
-            qseq: seq1,
-            qual: None,
-            comment: None,
-            n_seg: 2,
-            seg_idx: 0,
-        };
-        let read2 = ReadInfo {
-            qname: name,
-            qseq: seq2,
-            qual: None,
-            comment: None,
-            n_seg: 2,
-            seg_idx: 1,
-        };
+        let read1 = ReadInfo { qname: name, qseq: seq1, qual: None, comment: None, n_seg: 2, seg_idx: 0 };
+        let read2 = ReadInfo { qname: name, qseq: seq2, qual: None, comment: None, n_seg: 2, seg_idx: 1 };
         let (output, _stats) = pipeline::align_and_format_pair(
-            &self.options,
-            &self.index,
-            &read1,
-            &read2,
-            &mut ctx,
-            &mut map_ctx,
-            self.junc_db.as_ref(),
-            &out,
+            &self.options, &self.index, &read1, &read2,
+            &mut ctx, &mut map_ctx, self.junc_db.as_ref(), &out,
         );
         parse_paf_to_map_result(&output, &self.index)
     }
@@ -680,10 +546,7 @@ impl Aligner {
             .enumerate()
             .map(|(i, sq)| (sq.name.clone(), i))
             .collect();
-        let max_sc = junc::max_spsc_bonus(
-            self.options.scoring.gap_open2,
-            self.options.scoring.gap_open,
-        );
+        let max_sc = junc::max_spsc_bonus(self.options.scoring.gap_open2, self.options.scoring.gap_open);
         let scale = scale.unwrap_or(0.7);
         let seq_lens: Vec<usize> = self.index.seqs.iter().map(|s| s.len).collect();
         let db = junc::load_spsc_scores(
@@ -704,25 +567,13 @@ impl Aligner {
     pub fn format_paf(&self, name: &str, query_len: usize, result: &MapResult) -> String {
         let mut lines = Vec::new();
         for aln in &result.mappings {
-            let strand = if aln.strand == Strand::Forward {
-                '+'
-            } else {
-                '-'
-            };
+            let strand = if aln.strand == Strand::Forward { '+' } else { '-' };
             let mut line = format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                name,
-                query_len,
-                aln.query_start,
-                aln.query_end,
-                strand,
-                aln.target_name,
-                aln.target_len,
-                aln.target_start,
-                aln.target_end,
-                aln.matches,
-                aln.block_len,
-                aln.mapq,
+                name, query_len, aln.query_start, aln.query_end,
+                strand, aln.target_name, aln.target_len,
+                aln.target_start, aln.target_end,
+                aln.matches, aln.block_len, aln.mapq,
             );
             if let Some(ref cigar) = aln.cigar {
                 line.push_str(&format!("\tcg:Z:{}", cigar));
@@ -740,40 +591,23 @@ impl Aligner {
     }
 
     /// Access the underlying index.
-    pub fn index(&self) -> &Index {
-        &self.index
-    }
+    pub fn index(&self) -> &Index { &self.index }
 
     /// Access the current MapOptions.
-    pub fn options(&self) -> &MapOptions {
-        &self.options
-    }
+    pub fn options(&self) -> &MapOptions { &self.options }
 
     /// Mutably access MapOptions for fine-tuning after construction.
-    pub fn options_mut(&mut self) -> &mut MapOptions {
-        &mut self.options
-    }
+    pub fn options_mut(&mut self) -> &mut MapOptions { &mut self.options }
 
     /// Mutably access OutputConfig for toggling CIGAR/CS/MD/SAM defaults.
-    pub fn output_config_mut(&mut self) -> &mut OutputConfig {
-        &mut self.out_cfg
-    }
-
-    /// Access the current output configuration for native orchestration.
-    pub fn output_config(&self) -> &OutputConfig {
-        &self.out_cfg
-    }
+    pub fn output_config_mut(&mut self) -> &mut OutputConfig { &mut self.out_cfg }
 
     // --- Internal ---
 
     fn resolve_out_cfg(&self, opts: &MapOpts) -> OutputConfig {
         let mut out = self.out_cfg.clone();
-        if let Some(cs) = opts.cs {
-            out.do_cs = cs;
-        }
-        if let Some(md) = opts.md {
-            out.do_md = md;
-        }
+        if let Some(cs) = opts.cs { out.do_cs = cs; }
+        if let Some(md) = opts.md { out.do_md = md; }
         out
     }
 }
@@ -782,66 +616,49 @@ impl Aligner {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn to_map_result(pq: &pipeline::ProcessedQuery, mi: &Index, out: &OutputConfig) -> MapResult {
+fn to_map_result(
+    pq: &pipeline::ProcessedQuery,
+    mi: &Index,
+    out: &OutputConfig,
+) -> MapResult {
     // Cache only targets referenced by this query. A catalog-sized vector here
     // made every result conversion allocate O(target-count) state.
     let mut name_cache: HashMap<usize, Arc<str>> = HashMap::with_capacity(pq.results.len());
 
-    let mappings = pq
-        .results
-        .iter()
-        .zip(pq.mapqs.iter())
-        .map(|(r, &mapq)| {
-            let cigar_str = if out.do_cigar && !r.cigar_str.is_empty() {
-                Some(r.cigar_str.clone())
-            } else {
-                None
-            };
-            let cigar_ops = cigar_str.as_ref().map(|s| parse_cigar_string(s));
-            let trans_strand = match r.trans_strand {
-                1 => Some(Strand::Forward),
-                2 => Some(Strand::Reverse),
-                _ => None,
-            };
-            let target_name = cached_target_name(&mut name_cache, mi, r.ref_id);
-            Mapping {
-                target_name,
-                target_id: r.ref_id,
-                target_len: mi.seqs[r.ref_id].len,
-                target_start: r.ref_start,
-                target_end: r.ref_end,
-                query_start: r.query_start,
-                query_end: r.query_end,
-                strand: if r.is_reverse {
-                    Strand::Reverse
-                } else {
-                    Strand::Forward
-                },
-                mapq,
-                is_primary: !r.is_secondary,
-                is_supplementary: r.split != 0,
-                is_spliced: r.is_spliced,
-                trans_strand,
-                matches: r.matches,
-                block_len: r.block_len,
-                edit_distance: r.edit_distance,
-                cigar: cigar_str,
-                cigar_ops,
-                cs: if out.do_cs && !r.cs_str.is_empty() {
-                    Some(r.cs_str.clone())
-                } else {
-                    None
-                },
-                md: if out.do_md && !r.md_str.is_empty() {
-                    Some(r.md_str.clone())
-                } else {
-                    None
-                },
-                score: r.align_score,
-                divergence: r.divergence,
-            }
-        })
-        .collect();
+    let mappings = pq.results.iter().zip(pq.mapqs.iter()).map(|(r, &mapq)| {
+        let cigar_str = if out.do_cigar && !r.cigar_str.is_empty() { Some(r.cigar_str.clone()) } else { None };
+        let cigar_ops = cigar_str.as_ref().map(|s| parse_cigar_string(s));
+        let trans_strand = match r.trans_strand {
+            1 => Some(Strand::Forward),
+            2 => Some(Strand::Reverse),
+            _ => None,
+        };
+        let target_name = cached_target_name(&mut name_cache, mi, r.ref_id);
+        Mapping {
+            target_name,
+            target_id: r.ref_id,
+            target_len: mi.seqs[r.ref_id].len,
+            target_start: r.ref_start,
+            target_end: r.ref_end,
+            query_start: r.query_start,
+            query_end: r.query_end,
+            strand: if r.is_reverse { Strand::Reverse } else { Strand::Forward },
+            mapq,
+            is_primary: !r.is_secondary,
+            is_supplementary: r.split != 0,
+            is_spliced: r.is_spliced,
+            trans_strand,
+            matches: r.matches,
+            block_len: r.block_len,
+            edit_distance: r.edit_distance,
+            cigar: cigar_str,
+            cigar_ops,
+            cs: if out.do_cs && !r.cs_str.is_empty() { Some(r.cs_str.clone()) } else { None },
+            md: if out.do_md && !r.md_str.is_empty() { Some(r.md_str.clone()) } else { None },
+            score: r.align_score,
+            divergence: r.divergence,
+        }
+    }).collect();
     MapResult { mappings }
 }
 
@@ -865,19 +682,10 @@ fn parse_cigar_string(s: &str) -> Vec<CigarOp> {
             num = num * 10 + (c as u32 - '0' as u32);
         } else {
             let op = match c {
-                'M' => 0,
-                'I' => 1,
-                'D' => 2,
-                'N' => 3,
-                'S' => 4,
-                'H' => 5,
-                '=' => 7,
-                'X' => 8,
+                'M' => 0, 'I' => 1, 'D' => 2, 'N' => 3, 'S' => 4, 'H' => 5, '=' => 7, 'X' => 8,
                 _ => continue,
             };
-            if num > 0 {
-                ops.push(CigarOp { len: num, op });
-            }
+            if num > 0 { ops.push(CigarOp { len: num, op }); }
             num = 0;
         }
     }
@@ -888,13 +696,9 @@ fn parse_cigar_string(s: &str) -> Vec<CigarOp> {
 fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
     let mut mappings = Vec::new();
     for line in paf.lines() {
-        if line.is_empty() {
-            continue;
-        }
+        if line.is_empty() { continue; }
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 12 {
-            continue;
-        }
+        if fields.len() < 12 { continue; }
         let target_name: Arc<str> = Arc::from(fields[5]);
         let target_len = fields[6].parse().unwrap_or(0);
         let target_start: usize = fields[7].parse().unwrap_or(0);
@@ -904,11 +708,7 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
         let mapq: i32 = fields[11].parse().unwrap_or(0);
         let query_start: usize = fields[2].parse().unwrap_or(0);
         let query_end: usize = fields[3].parse().unwrap_or(0);
-        let strand = if fields[4] == "+" {
-            Strand::Forward
-        } else {
-            Strand::Reverse
-        };
+        let strand = if fields[4] == "+" { Strand::Forward } else { Strand::Reverse };
 
         // Extract optional tags
         let mut cigar = None;
@@ -918,64 +718,33 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
         let mut divergence = 0.0f64;
         let mut is_secondary = false;
         for &tag in &fields[12..] {
-            if let Some(val) = tag.strip_prefix("cg:Z:") {
-                cigar = Some(val.to_string());
-            } else if let Some(val) = tag.strip_prefix("cs:Z:") {
-                cs = Some(val.to_string());
-            } else if let Some(val) = tag.strip_prefix("AS:i:") {
-                score = val.parse().unwrap_or(0);
-            } else if let Some(val) = tag.strip_prefix("NM:i:") {
-                edit_distance = val.parse().unwrap_or(0);
-            } else if let Some(val) = tag.strip_prefix("de:f:") {
-                divergence = val.parse().unwrap_or(0.0);
-            } else if tag.starts_with("tp:A:S") || tag.starts_with("tp:A:s") {
-                is_secondary = true;
-            }
+            if let Some(val) = tag.strip_prefix("cg:Z:") { cigar = Some(val.to_string()); }
+            else if let Some(val) = tag.strip_prefix("cs:Z:") { cs = Some(val.to_string()); }
+            else if let Some(val) = tag.strip_prefix("AS:i:") { score = val.parse().unwrap_or(0); }
+            else if let Some(val) = tag.strip_prefix("NM:i:") { edit_distance = val.parse().unwrap_or(0); }
+            else if let Some(val) = tag.strip_prefix("de:f:") { divergence = val.parse().unwrap_or(0.0); }
+            else if tag.starts_with("tp:A:S") || tag.starts_with("tp:A:s") { is_secondary = true; }
         }
 
         let cigar_ops = cigar.as_ref().map(|s| parse_cigar_string(s));
-        let is_spliced = cigar_ops
-            .as_ref()
-            .is_some_and(|ops| ops.iter().any(|op| op.op == 3));
+        let is_spliced = cigar_ops.as_ref().is_some_and(|ops| ops.iter().any(|op| op.op == 3));
 
         // Extract md tag
         let mut md = None;
         for &tag in &fields[12..] {
-            if let Some(val) = tag.strip_prefix("MD:Z:") {
-                md = Some(val.to_string());
-            }
+            if let Some(val) = tag.strip_prefix("MD:Z:") { md = Some(val.to_string()); }
         }
 
         // Find target_id by name
-        let target_id = _mi
-            .seqs
-            .iter()
-            .position(|s| s.name.as_str() == &*target_name)
-            .unwrap_or(0);
+        let target_id = _mi.seqs.iter().position(|s| s.name.as_str() == &*target_name).unwrap_or(0);
 
         mappings.push(Mapping {
-            target_name,
-            target_id,
-            target_len,
-            target_start,
-            target_end,
-            query_start,
-            query_end,
-            strand,
-            mapq,
-            is_primary: !is_secondary,
-            is_supplementary: false,
-            is_spliced,
-            trans_strand: None,
-            matches,
-            block_len,
-            edit_distance,
-            cigar,
-            cigar_ops,
-            cs,
-            md,
-            score,
-            divergence,
+            target_name, target_id, target_len, target_start, target_end,
+            query_start, query_end, strand, mapq,
+            is_primary: !is_secondary, is_supplementary: false,
+            is_spliced, trans_strand: None,
+            matches, block_len,
+            edit_distance, cigar, cigar_ops, cs, md, score, divergence,
         });
     }
     MapResult { mappings }
@@ -991,13 +760,7 @@ fn parse_paf_to_map_result(paf: &str, _mi: &Index) -> MapResult {
 /// `k`, `w`, and `is_hpc` in place. Returns an error if the preset name
 /// is not recognized so the caller can abort rather than silently using
 /// the default configuration.
-pub fn apply_preset_str(
-    opt: &mut MapOptions,
-    k: &mut usize,
-    w: &mut usize,
-    is_hpc: &mut bool,
-    preset: &str,
-) -> Result<(), String> {
+pub fn apply_preset_str(opt: &mut MapOptions, k: &mut usize, w: &mut usize, is_hpc: &mut bool, preset: &str) -> Result<(), String> {
     // Reset SIMD cap each time so switching presets has predictable behavior.
     // Specific presets below opt back into a cap if their workload is hurt by
     // AVX-512's per-core license throttling (chain/seed-heavy presets where DP
@@ -1005,59 +768,42 @@ pub fn apply_preset_str(
     crate::align::dp::set_simd_cap(crate::align::dp::SimdCap::Auto);
     match preset {
         "lr" | "map-ont" => {
-            *k = 15;
-            *w = 10;
-        }
+            *k = 15; *w = 10;
+        },
         "map10k" | "map-pb" => {
-            *is_hpc = true;
-            *k = 19;
-        }
+            *is_hpc = true; *k = 19;
+        },
         "lr:hq" => {
-            *k = 19;
-            *w = 19;
+            *k = 19; *w = 19;
             opt.chaining.max_gap = 10000;
-            opt.seeding.min_mid_occ = 50;
-            opt.seeding.max_mid_occ = 500;
-        }
+            opt.seeding.min_mid_occ = 50; opt.seeding.max_mid_occ = 500;
+        },
         "map-hifi" | "map-ccs" => {
-            *k = 19;
-            *w = 19;
+            *k = 19; *w = 19;
             opt.chaining.max_gap = 10000;
-            opt.seeding.min_mid_occ = 50;
-            opt.seeding.max_mid_occ = 500;
-            opt.scoring.match_score = 1;
-            opt.scoring.mismatch_penalty = 4;
-            opt.scoring.gap_open = 6;
-            opt.scoring.gap_open2 = 26;
-            opt.scoring.gap_extend = 2;
-            opt.scoring.gap_extend2 = 1;
+            opt.seeding.min_mid_occ = 50; opt.seeding.max_mid_occ = 500;
+            opt.scoring.match_score = 1; opt.scoring.mismatch_penalty = 4; opt.scoring.gap_open = 6; opt.scoring.gap_open2 = 26; opt.scoring.gap_extend = 2; opt.scoring.gap_extend2 = 1;
             opt.alignment.min_dp_max = 200;
-        }
+        },
         "lr:hqae" => {
-            *k = 25;
-            *w = 51;
+            *k = 25; *w = 51;
             opt.flags.insert(AlignFlags::RMQ_CHAIN);
-            opt.seeding.min_mid_occ = 50;
-            opt.seeding.max_mid_occ = 500;
+            opt.seeding.min_mid_occ = 50; opt.seeding.max_mid_occ = 500;
             opt.chaining.rmq_inner_dist = 5000;
             opt.seeding.occ_dist = 200;
             opt.filtering.best_n = 100;
             opt.chaining.chain_gap_scale = 5.0;
-        }
+        },
         "map-iclr-prerender" => {
             *k = 15;
-            opt.scoring.mismatch_penalty = 6;
-            opt.scoring.transition = 1;
-            opt.scoring.gap_open = 10;
-            opt.scoring.gap_open2 = 50;
-        }
+            opt.scoring.mismatch_penalty = 6; opt.scoring.transition = 1;
+            opt.scoring.gap_open = 10; opt.scoring.gap_open2 = 50;
+        },
         "map-iclr" => {
             *k = 19;
-            opt.scoring.mismatch_penalty = 6;
-            opt.scoring.transition = 4;
-            opt.scoring.gap_open = 10;
-            opt.scoring.gap_open2 = 50;
-        }
+            opt.scoring.mismatch_penalty = 6; opt.scoring.transition = 4;
+            opt.scoring.gap_open = 10; opt.scoring.gap_open2 = 50;
+        },
         "strainxpress-sr-ava" => {
             *k = 21;
             *w = 11;
@@ -1076,86 +822,49 @@ pub fn apply_preset_str(
             opt.scoring.match_score = 4;
             opt.scoring.mismatch_penalty = 2;
             opt.alignment.end_bonus = 100;
-        }
+        },
         p if p.starts_with("asm") => {
-            *k = 19;
-            *w = 19;
-            opt.chaining.bandwidth = 1000;
-            opt.chaining.bandwidth_long = 100000;
+            *k = 19; *w = 19;
+            opt.chaining.bandwidth = 1000; opt.chaining.bandwidth_long = 100000;
             opt.chaining.max_gap = 10000;
             opt.flags.insert(AlignFlags::RMQ_CHAIN);
-            opt.seeding.min_mid_occ = 50;
-            opt.seeding.max_mid_occ = 500;
+            opt.seeding.min_mid_occ = 50; opt.seeding.max_mid_occ = 500;
             opt.alignment.min_dp_max = 200;
             opt.filtering.best_n = 50;
             match p {
                 "asm5" => {
-                    opt.scoring.match_score = 1;
-                    opt.scoring.mismatch_penalty = 19;
-                    opt.scoring.gap_open = 39;
-                    opt.scoring.gap_open2 = 81;
-                    opt.scoring.gap_extend = 3;
-                    opt.scoring.gap_extend2 = 1;
-                    opt.alignment.zdrop = 200;
-                    opt.alignment.zdrop_inv = 200;
-                }
+                    opt.scoring.match_score = 1; opt.scoring.mismatch_penalty = 19; opt.scoring.gap_open = 39; opt.scoring.gap_open2 = 81; opt.scoring.gap_extend = 3; opt.scoring.gap_extend2 = 1;
+                    opt.alignment.zdrop = 200; opt.alignment.zdrop_inv = 200;
+                },
                 "asm10" => {
-                    opt.scoring.match_score = 1;
-                    opt.scoring.mismatch_penalty = 9;
-                    opt.scoring.gap_open = 16;
-                    opt.scoring.gap_open2 = 41;
-                    opt.scoring.gap_extend = 2;
-                    opt.scoring.gap_extend2 = 1;
-                    opt.alignment.zdrop = 200;
-                    opt.alignment.zdrop_inv = 200;
-                }
+                    opt.scoring.match_score = 1; opt.scoring.mismatch_penalty = 9; opt.scoring.gap_open = 16; opt.scoring.gap_open2 = 41; opt.scoring.gap_extend = 2; opt.scoring.gap_extend2 = 1;
+                    opt.alignment.zdrop = 200; opt.alignment.zdrop_inv = 200;
+                },
                 "asm20" => {
-                    opt.scoring.match_score = 1;
-                    opt.scoring.mismatch_penalty = 4;
-                    opt.scoring.gap_open = 6;
-                    opt.scoring.gap_open2 = 26;
-                    opt.scoring.gap_extend = 2;
-                    opt.scoring.gap_extend2 = 1;
-                    opt.alignment.zdrop = 200;
-                    opt.alignment.zdrop_inv = 200;
+                    opt.scoring.match_score = 1; opt.scoring.mismatch_penalty = 4; opt.scoring.gap_open = 6; opt.scoring.gap_open2 = 26; opt.scoring.gap_extend = 2; opt.scoring.gap_extend2 = 1;
+                    opt.alignment.zdrop = 200; opt.alignment.zdrop_inv = 200;
                     *w = 10;
-                }
+                },
                 _ => {
-                    return Err(format!(
-                        "unrecognized asm preset '{}' (expected asm5, asm10, or asm20)",
-                        p
-                    ));
+                    return Err(format!("unrecognized asm preset '{}' (expected asm5, asm10, or asm20)", p));
                 }
             }
-        }
+        },
         "short" | "sr" => {
             // Cap SIMD at AVX2: SR mapping spends ~7-10% of CPU in DP and the rest
             // in chaining/seeding/output, so AVX-512's all-core license throttle
             // (200-600 MHz drop on Skylake-X / Cascade / Cooper Lake) costs more
             // than the DP speedup wins. RAMMAP_FORCE_AVX512=1 overrides this.
             crate::align::dp::set_simd_cap(crate::align::dp::SimdCap::Avx2);
-            *k = 21;
-            *w = 11;
-            opt.flags.insert(
-                AlignFlags::SHORT_READ
-                    | AlignFlags::FRAG_MODE
-                    | AlignFlags::NO_PRINT_2ND
-                    | AlignFlags::HEAP_SORT,
-            );
+            *k = 21; *w = 11;
+            opt.flags.insert(AlignFlags::SHORT_READ | AlignFlags::FRAG_MODE | AlignFlags::NO_PRINT_2ND | AlignFlags::HEAP_SORT);
             opt.pairing.pe_ori = 1;
-            opt.scoring.match_score = 2;
-            opt.scoring.mismatch_penalty = 8;
-            opt.scoring.gap_open = 12;
-            opt.scoring.gap_extend = 2;
-            opt.scoring.gap_open2 = 24;
-            opt.scoring.gap_extend2 = 1;
-            opt.alignment.zdrop = 100;
-            opt.alignment.zdrop_inv = 100;
+            opt.scoring.match_score = 2; opt.scoring.mismatch_penalty = 8; opt.scoring.gap_open = 12; opt.scoring.gap_extend = 2; opt.scoring.gap_open2 = 24; opt.scoring.gap_extend2 = 1;
+            opt.alignment.zdrop = 100; opt.alignment.zdrop_inv = 100;
             opt.alignment.end_bonus = 10;
             opt.pairing.max_frag_len = 800;
             opt.chaining.max_gap = 100;
-            opt.chaining.bandwidth = 100;
-            opt.chaining.bandwidth_long = 100;
+            opt.chaining.bandwidth = 100; opt.chaining.bandwidth_long = 100;
             opt.filtering.pri_ratio = 0.5;
             opt.chaining.min_cnt = 2;
             opt.chaining.min_chain_score = 25;
@@ -1164,50 +873,25 @@ pub fn apply_preset_str(
             opt.seeding.mid_occ = 1000;
             opt.seeding.max_occ = 5000;
             opt.mini_batch_size = 50_000_000;
-        }
+        },
         p if p.starts_with("splice") || p == "cdna" => {
-            *k = 15;
-            *w = 5;
-            opt.flags.insert(
-                AlignFlags::SPLICE
-                    | AlignFlags::SPLICE_FOR
-                    | AlignFlags::SPLICE_REV
-                    | AlignFlags::SPLICE_FLANK,
-            );
+            *k = 15; *w = 5;
+            opt.flags.insert(AlignFlags::SPLICE | AlignFlags::SPLICE_FOR | AlignFlags::SPLICE_REV | AlignFlags::SPLICE_FLANK);
             opt.alignment.max_sw_mat = 0;
             opt.chaining.max_gap = 2000;
             opt.chaining.max_gap_ref = 200000;
-            opt.chaining.bandwidth = 200000;
-            opt.chaining.bandwidth_long = 200000;
-            opt.scoring.match_score = 1;
-            opt.scoring.mismatch_penalty = 2;
-            opt.scoring.gap_open = 2;
-            opt.scoring.gap_extend = 1;
-            opt.scoring.gap_open2 = 32;
-            opt.scoring.gap_extend2 = 0;
+            opt.chaining.bandwidth = 200000; opt.chaining.bandwidth_long = 200000;
+            opt.scoring.match_score = 1; opt.scoring.mismatch_penalty = 2; opt.scoring.gap_open = 2; opt.scoring.gap_extend = 1; opt.scoring.gap_open2 = 32; opt.scoring.gap_extend2 = 0;
             opt.scoring.noncanon_penalty = 9;
             opt.scoring.junc_bonus = 9;
             opt.scoring.junc_pen = 5;
-            opt.alignment.zdrop = 200;
-            opt.alignment.zdrop_inv = 100;
+            opt.alignment.zdrop = 200; opt.alignment.zdrop_inv = 100;
             opt.filtering.is_splice = true;
             if p == "splice:hq" {
-                opt.scoring.noncanon_penalty = 5;
-                opt.scoring.mismatch_penalty = 4;
-                opt.scoring.gap_open = 6;
-                opt.scoring.gap_open2 = 24;
+                opt.scoring.noncanon_penalty = 5; opt.scoring.mismatch_penalty = 4; opt.scoring.gap_open = 6; opt.scoring.gap_open2 = 24;
             } else if p == "splice:sr" {
-                opt.flags.insert(
-                    AlignFlags::NO_PRINT_2ND
-                        | AlignFlags::HEAP_SORT
-                        | AlignFlags::FRAG_MODE
-                        | AlignFlags::WEAK_PAIRING
-                        | AlignFlags::SR_RNA,
-                );
-                opt.scoring.noncanon_penalty = 5;
-                opt.scoring.mismatch_penalty = 4;
-                opt.scoring.gap_open = 6;
-                opt.scoring.gap_open2 = 24;
+                opt.flags.insert(AlignFlags::NO_PRINT_2ND | AlignFlags::HEAP_SORT | AlignFlags::FRAG_MODE | AlignFlags::WEAK_PAIRING | AlignFlags::SR_RNA);
+                opt.scoring.noncanon_penalty = 5; opt.scoring.mismatch_penalty = 4; opt.scoring.gap_open = 6; opt.scoring.gap_open2 = 24;
                 opt.chaining.min_chain_score = 25;
                 opt.alignment.min_dp_max = 40;
                 opt.alignment.min_dp_len = 20;
@@ -1215,44 +899,28 @@ pub fn apply_preset_str(
                 opt.filtering.best_n = 10;
                 opt.mini_batch_size = 100_000_000;
             }
-        }
+        },
         "ava-ont" => {
             // Cap SIMD at AVX2 — AVA workload is dominated by chaining (ALL_CHAINS)
             // with no base-level alignment, so AVX-512 throttling pure-loses here.
             crate::align::dp::set_simd_cap(crate::align::dp::SimdCap::Avx2);
-            *k = 15;
-            *w = 5;
-            opt.flags.insert(
-                AlignFlags::ALL_CHAINS
-                    | AlignFlags::NO_DIAG
-                    | AlignFlags::NO_DUAL
-                    | AlignFlags::NO_LJOIN,
-            );
-            opt.chaining.min_chain_score = 100;
-            opt.filtering.pri_ratio = 0.0;
+            *k = 15; *w = 5;
+            opt.flags.insert(AlignFlags::ALL_CHAINS | AlignFlags::NO_DIAG | AlignFlags::NO_DUAL | AlignFlags::NO_LJOIN);
+            opt.chaining.min_chain_score = 100; opt.filtering.pri_ratio = 0.0;
             opt.chaining.max_chain_skip = 25;
-            opt.chaining.bandwidth = 2000;
-            opt.chaining.bandwidth_long = 2000;
+            opt.chaining.bandwidth = 2000; opt.chaining.bandwidth_long = 2000;
             opt.seeding.occ_dist = 0;
-        }
+        },
         "ava-pb" => {
             // Cap SIMD at AVX2 — same reasoning as ava-ont.
             crate::align::dp::set_simd_cap(crate::align::dp::SimdCap::Avx2);
-            *is_hpc = true;
-            *k = 19;
-            *w = 5;
-            opt.flags.insert(
-                AlignFlags::ALL_CHAINS
-                    | AlignFlags::NO_DIAG
-                    | AlignFlags::NO_DUAL
-                    | AlignFlags::NO_LJOIN,
-            );
-            opt.chaining.min_chain_score = 100;
-            opt.filtering.pri_ratio = 0.0;
+            *is_hpc = true; *k = 19; *w = 5;
+            opt.flags.insert(AlignFlags::ALL_CHAINS | AlignFlags::NO_DIAG | AlignFlags::NO_DUAL | AlignFlags::NO_LJOIN);
+            opt.chaining.min_chain_score = 100; opt.filtering.pri_ratio = 0.0;
             opt.chaining.max_chain_skip = 25;
             opt.chaining.bandwidth_long = opt.chaining.bandwidth;
             opt.seeding.occ_dist = 0;
-        }
+        },
         _ => {
             return Err(format!("unrecognized preset '{}'", preset));
         }
@@ -1284,14 +952,7 @@ pub struct DpScoring {
 
 impl Default for DpScoring {
     fn default() -> Self {
-        DpScoring {
-            match_score: 2,
-            mismatch: 4,
-            gap_open: 4,
-            gap_extend: 2,
-            gap_open2: 0,
-            gap_extend2: 0,
-        }
+        DpScoring { match_score: 2, mismatch: 4, gap_open: 4, gap_extend: 2, gap_open2: 0, gap_extend2: 0 }
     }
 }
 
@@ -1346,33 +1007,16 @@ pub fn dp_align(query: &[u8], target: &[u8], scoring: &DpScoring, bandwidth: i32
 
     if scoring.gap_open2 > 0 || scoring.gap_extend2 > 0 {
         dp::extend_dual_affine(
-            query,
-            target,
-            5,
-            &mat,
-            scoring.gap_open as i8,
-            scoring.gap_extend as i8,
-            scoring.gap_open2 as i8,
-            scoring.gap_extend2 as i8,
-            bandwidth,
-            -1,
-            0,
-            dp::APPROX_MAX,
-            &mut ez,
+            query, target, 5, &mat,
+            scoring.gap_open as i8, scoring.gap_extend as i8,
+            scoring.gap_open2 as i8, scoring.gap_extend2 as i8,
+            bandwidth, -1, 0, dp::APPROX_MAX, &mut ez,
         );
     } else {
         dp::extend_single_affine(
-            query,
-            target,
-            5,
-            &mat,
-            scoring.gap_open as i8,
-            scoring.gap_extend as i8,
-            bandwidth,
-            -1,
-            0,
-            dp::APPROX_MAX,
-            &mut ez,
+            query, target, 5, &mat,
+            scoring.gap_open as i8, scoring.gap_extend as i8,
+            bandwidth, -1, 0, dp::APPROX_MAX, &mut ez,
         );
     }
 
@@ -1381,14 +1025,8 @@ pub fn dp_align(query: &[u8], target: &[u8], scoring: &DpScoring, bandwidth: i32
     let (qs, qe, ts, te) = cigar_bounds(cigar_raw);
     // Recompute score from CIGAR for consistency across SIMD variants
     let score = compute_score_from_cigar(
-        cigar_raw,
-        query,
-        target,
-        &mat,
-        scoring.gap_open,
-        scoring.gap_extend,
-        scoring.gap_open2,
-        scoring.gap_extend2,
+        cigar_raw, query, target, &mat,
+        scoring.gap_open, scoring.gap_extend, scoring.gap_open2, scoring.gap_extend2,
     );
     DpAlignment {
         score,
@@ -1417,26 +1055,14 @@ pub fn dp_global(query: &[u8], target: &[u8], scoring: &DpScoring, bandwidth: i3
     let mat = build_scoring_matrix(scoring.match_score, scoring.mismatch);
     let mut ez = dp::DpResult::default();
     dp::global_align(
-        query,
-        target,
-        5,
-        &mat,
-        scoring.gap_open,
-        scoring.gap_extend,
-        bandwidth,
-        &mut ez,
+        query, target, 5, &mat,
+        scoring.gap_open, scoring.gap_extend,
+        bandwidth, &mut ez,
     );
 
     let cigar = raw_cigar_to_string(&ez.cigar);
     let (qs, qe, ts, te) = cigar_bounds(&ez.cigar);
-    DpAlignment {
-        score: ez.score,
-        cigar,
-        query_start: qs,
-        query_end: qe,
-        target_start: ts,
-        target_end: te,
-    }
+    DpAlignment { score: ez.score, cigar, query_start: qs, query_end: qe, target_start: ts, target_end: te }
 }
 
 /// Local alignment (Smith-Waterman): find the best-scoring local region.
@@ -1458,21 +1084,10 @@ pub fn dp_local(query: &[u8], target: &[u8], scoring: &DpScoring) -> DpAlignment
     // Phase 1: Forward Smith-Waterman to find the best endpoint
     let mut qp = dp::lightweight_profile_init(query.len() as i32, query, 5, &mat);
     let (score, q_end, t_end) = dp::lightweight_align_i16(
-        &mut qp,
-        target.len() as i32,
-        target,
-        scoring.gap_open,
-        scoring.gap_extend,
+        &mut qp, target.len() as i32, target, scoring.gap_open, scoring.gap_extend,
     );
     if score <= 0 || q_end < 0 || t_end < 0 {
-        return DpAlignment {
-            score: 0,
-            cigar: String::new(),
-            query_start: 0,
-            query_end: 0,
-            target_start: 0,
-            target_end: 0,
-        };
+        return DpAlignment { score: 0, cigar: String::new(), query_start: 0, query_end: 0, target_start: 0, target_end: 0 };
     }
 
     let qe = q_end as usize + 1;
@@ -1483,15 +1098,9 @@ pub fn dp_local(query: &[u8], target: &[u8], scoring: &DpScoring) -> DpAlignment
     let t_rev: Vec<u8> = target[..te].iter().rev().copied().collect();
     let mut ez = dp::DpResult::default();
     dp::extend_single_affine(
-        &q_rev,
-        &t_rev,
-        5,
-        &mat,
-        scoring.gap_open as i8,
-        scoring.gap_extend as i8,
-        -1,
-        score,
-        0,
+        &q_rev, &t_rev, 5, &mat,
+        scoring.gap_open as i8, scoring.gap_extend as i8,
+        -1, score, 0,
         dp::EXTENSION_ONLY | dp::REV_CIGAR,
         &mut ez,
     );
@@ -1515,12 +1124,7 @@ pub fn dp_local(query: &[u8], target: &[u8], scoring: &DpScoring) -> DpAlignment
 ///
 /// Useful for extending a seed match left or right. Returns the optimal-scoring
 /// prefix alignment (may not reach the end of either sequence).
-pub fn dp_extension(
-    query: &[u8],
-    target: &[u8],
-    scoring: &DpScoring,
-    bandwidth: i32,
-) -> DpAlignment {
+pub fn dp_extension(query: &[u8], target: &[u8], scoring: &DpScoring, bandwidth: i32) -> DpAlignment {
     use crate::align::dp::{self, EXTENSION_ONLY};
     use crate::align::extend::build_scoring_matrix;
 
@@ -1530,48 +1134,23 @@ pub fn dp_extension(
     let zdrop = 400; // default z-drop threshold for extension
     if scoring.gap_open2 > 0 || scoring.gap_extend2 > 0 {
         dp::extend_dual_affine(
-            query,
-            target,
-            5,
-            &mat,
-            scoring.gap_open as i8,
-            scoring.gap_extend as i8,
-            scoring.gap_open2 as i8,
-            scoring.gap_extend2 as i8,
-            bandwidth,
-            zdrop,
-            0,
-            EXTENSION_ONLY,
-            &mut ez,
+            query, target, 5, &mat,
+            scoring.gap_open as i8, scoring.gap_extend as i8,
+            scoring.gap_open2 as i8, scoring.gap_extend2 as i8,
+            bandwidth, zdrop, 0, EXTENSION_ONLY, &mut ez,
         );
     } else {
         dp::extend_single_affine(
-            query,
-            target,
-            5,
-            &mat,
-            scoring.gap_open as i8,
-            scoring.gap_extend as i8,
-            bandwidth,
-            zdrop,
-            0,
-            EXTENSION_ONLY,
-            &mut ez,
+            query, target, 5, &mat,
+            scoring.gap_open as i8, scoring.gap_extend as i8,
+            bandwidth, zdrop, 0, EXTENSION_ONLY, &mut ez,
         );
     }
 
     let cigar = raw_cigar_to_string(&ez.cigar);
     let (qs, qe, ts, te) = cigar_bounds(&ez.cigar);
-    let ext_qe = if ez.max_score_query_pos >= 0 {
-        std::cmp::min(qe, ez.max_score_query_pos as usize + 1)
-    } else {
-        qe
-    };
-    let ext_te = if ez.max_score_target_pos >= 0 {
-        std::cmp::min(te, ez.max_score_target_pos as usize + 1)
-    } else {
-        te
-    };
+    let ext_qe = if ez.max_score_query_pos >= 0 { std::cmp::min(qe, ez.max_score_query_pos as usize + 1) } else { qe };
+    let ext_te = if ez.max_score_target_pos >= 0 { std::cmp::min(te, ez.max_score_target_pos as usize + 1) } else { te };
     DpAlignment {
         score: ez.score,
         cigar,
@@ -1586,9 +1165,7 @@ pub fn dp_extension(
 ///
 /// Required for DP alignment functions which operate on nt4-encoded sequences.
 pub fn encode_nt4(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .map(|&b| crate::align::extend::encode_nt4_byte(b))
-        .collect()
+    seq.iter().map(|&b| crate::align::extend::encode_nt4_byte(b)).collect()
 }
 
 /// Compute true alignment score from raw CIGAR + sequences.
@@ -1596,14 +1173,8 @@ pub fn encode_nt4(seq: &[u8]) -> Vec<u8> {
 /// affine penalties. If gap_open2/gap_extend2 are nonzero, uses dual-affine
 /// model (min of both gap costs).
 fn compute_score_from_cigar(
-    cigar: &[u32],
-    query: &[u8],
-    target: &[u8],
-    mat: &[i8],
-    gapo: i32,
-    gape: i32,
-    gapo2: i32,
-    gape2: i32,
+    cigar: &[u32], query: &[u8], target: &[u8],
+    mat: &[i8], gapo: i32, gape: i32, gapo2: i32, gape2: i32,
 ) -> i32 {
     let dual = gapo2 > 0 || gape2 > 0;
     let mut score = 0i32;
@@ -1612,19 +1183,16 @@ fn compute_score_from_cigar(
     for &c in cigar {
         let len = (c >> 4) as usize;
         match c & 0xf {
-            0 => {
-                // M: match/mismatch
+            0 => { // M: match/mismatch
                 for _ in 0..len {
                     if qi < query.len() && ti < target.len() {
-                        score +=
-                            mat[target[ti].min(4) as usize * 5 + query[qi].min(4) as usize] as i32;
+                        score += mat[target[ti].min(4) as usize * 5 + query[qi].min(4) as usize] as i32;
                     }
                     qi += 1;
                     ti += 1;
                 }
             }
-            1 => {
-                // I: insertion (query gap)
+            1 => { // I: insertion (query gap)
                 let cost = gapo + gape * len as i32;
                 if dual {
                     let cost2 = gapo2 + gape2 * len as i32;
@@ -1634,8 +1202,7 @@ fn compute_score_from_cigar(
                 }
                 qi += len;
             }
-            2 => {
-                // D: deletion (target gap)
+            2 => { // D: deletion (target gap)
                 let cost = gapo + gape * len as i32;
                 if dual {
                     let cost2 = gapo2 + gape2 * len as i32;
@@ -1674,16 +1241,9 @@ fn cigar_bounds(cigar: &[u32]) -> (usize, usize, usize, usize) {
     for &c in cigar {
         let len = (c >> 4) as usize;
         match c & 0xf {
-            0 => {
-                qlen += len;
-                tlen += len;
-            } // M
-            1 => {
-                qlen += len;
-            } // I
-            2 => {
-                tlen += len;
-            } // D
+            0 => { qlen += len; tlen += len; } // M
+            1 => { qlen += len; }               // I
+            2 => { tlen += len; }               // D
             _ => {}
         }
     }
@@ -1709,19 +1269,12 @@ mod tests {
 
     #[test]
     fn test_builder_k_override_rescales_chn_pen_gap() {
-        let a = Aligner::builder(Preset::MapOnt)
-            .k(12)
-            .w(1)
-            .from_seqs(test_seqs())
-            .unwrap();
+        let a = Aligner::builder(Preset::MapOnt).k(12).w(1).from_seqs(test_seqs()).unwrap();
         assert_eq!(a.index().kmer_size, 12);
         assert_eq!(a.index().window_size, 1);
         assert_eq!(a.options().chaining.chn_pen_gap, expected_chn_pen_gap(12));
 
-        let b = Aligner::builder(Preset::Sr)
-            .k(15)
-            .from_seqs(test_seqs())
-            .unwrap();
+        let b = Aligner::builder(Preset::Sr).k(15).from_seqs(test_seqs()).unwrap();
         assert_eq!(b.options().chaining.chn_pen_gap, expected_chn_pen_gap(15));
     }
 
@@ -1729,28 +1282,16 @@ mod tests {
     fn test_from_index_derives_chn_pen_gap_from_index_k() {
         let path = std::env::temp_dir().join("rammap_api_from_index_k25.rmmi");
         let p = path.to_str().unwrap();
-        Aligner::builder(Preset::MapOnt)
-            .k(25)
-            .w(20)
-            .from_seqs(test_seqs())
-            .unwrap()
-            .save_index(p)
-            .unwrap();
+        Aligner::builder(Preset::MapOnt).k(25).w(20).from_seqs(test_seqs()).unwrap()
+            .save_index(p).unwrap();
 
         let a = Aligner::from_index(p, Preset::MapOnt).unwrap();
         assert_eq!(a.index().kmer_size, 25);
         assert_eq!(a.options().chaining.chn_pen_gap, expected_chn_pen_gap(25));
 
         // Geometry of a pre-built index is fixed; a conflicting override is an error.
-        assert!(Aligner::builder(Preset::MapOnt)
-            .k(15)
-            .from_index(p)
-            .is_err());
-        assert!(Aligner::builder(Preset::MapOnt)
-            .k(25)
-            .w(20)
-            .from_index(p)
-            .is_ok());
+        assert!(Aligner::builder(Preset::MapOnt).k(15).from_index(p).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).k(25).w(20).from_index(p).is_ok());
 
         let _ = std::fs::remove_file(p);
     }
@@ -1765,10 +1306,7 @@ mod tests {
         let ont = Aligner::from_seqs(test_seqs(), Preset::MapOnt);
         assert!(ont.options().seeding.mid_occ > 0);
 
-        let explicit = Aligner::builder(Preset::MapOnt)
-            .mid_occ(77)
-            .from_seqs(test_seqs())
-            .unwrap();
+        let explicit = Aligner::builder(Preset::MapOnt).mid_occ(77).from_seqs(test_seqs()).unwrap();
         assert_eq!(explicit.options().seeding.mid_occ, 77);
     }
 
@@ -1776,47 +1314,23 @@ mod tests {
     fn test_out_cigar_flag_matches_output_config() {
         for a in [
             Aligner::from_seqs(test_seqs(), Preset::MapOnt),
-            Aligner::builder(Preset::MapOnt)
-                .cigar(true)
-                .from_seqs(test_seqs())
-                .unwrap(),
+            Aligner::builder(Preset::MapOnt).cigar(true).from_seqs(test_seqs()).unwrap(),
         ] {
             assert!(a.options().flags.contains(AlignFlags::OUT_CIGAR));
         }
-        let off = Aligner::builder(Preset::MapOnt)
-            .cigar(false)
-            .from_seqs(test_seqs())
-            .unwrap();
+        let off = Aligner::builder(Preset::MapOnt).cigar(false).from_seqs(test_seqs()).unwrap();
         assert!(!off.options().flags.contains(AlignFlags::OUT_CIGAR));
     }
 
     #[test]
     fn test_builder_rejects_invalid_params() {
-        assert!(Aligner::builder(Preset::MapOnt)
-            .k(0)
-            .from_seqs(test_seqs())
-            .is_err());
-        assert!(Aligner::builder(Preset::MapOnt)
-            .k(MAX_KMER + 1)
-            .from_seqs(test_seqs())
-            .is_err());
-        assert!(Aligner::builder(Preset::MapOnt)
-            .w(0)
-            .from_seqs(test_seqs())
-            .is_err());
-        assert!(Aligner::builder(Preset::MapOnt)
-            .mid_occ_frac(1.0)
-            .from_seqs(test_seqs())
-            .is_err());
-        assert!(Aligner::builder(Preset::MapOnt)
-            .min_mid_occ(100)
-            .max_mid_occ(10)
-            .from_seqs(test_seqs())
-            .is_err());
-        assert!(Aligner::builder(Preset::MapOnt)
-            .k(MAX_KMER)
-            .from_seqs(test_seqs())
-            .is_ok());
+        assert!(Aligner::builder(Preset::MapOnt).k(0).from_seqs(test_seqs()).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).k(MAX_KMER + 1).from_seqs(test_seqs()).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).w(0).from_seqs(test_seqs()).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).mid_occ_frac(1.0).from_seqs(test_seqs()).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).min_mid_occ(100).max_mid_occ(10)
+            .from_seqs(test_seqs()).is_err());
+        assert!(Aligner::builder(Preset::MapOnt).k(MAX_KMER).from_seqs(test_seqs()).is_ok());
     }
 
     /// A homopolymer-compressed seed can span more query bases than target
@@ -1829,13 +1343,9 @@ mod tests {
         let mut x = 12345u64;
         let mut tseq: Vec<u8> = Vec::new();
         while tseq.len() < 2000 {
-            x = x
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             let b = b"ACGT"[(x >> 33) as usize % 4];
-            if tseq.last() != Some(&b) {
-                tseq.push(b);
-            }
+            if tseq.last() != Some(&b) { tseq.push(b); }
         }
         let qseq: Vec<u8> = tseq.iter().flat_map(|&b| [b; 3]).collect();
 
@@ -1847,32 +1357,18 @@ mod tests {
         let res = aligner.map_seq("query", &qseq);
         assert!(!res.mappings.is_empty(), "expected at least one mapping");
         for m in &res.mappings {
-            assert!(
-                m.target_start <= m.target_end,
-                "target_start {} exceeds target_end {} (underflow)",
-                m.target_start,
-                m.target_end
-            );
-            assert!(
-                m.target_end <= tseq.len(),
-                "target_end {} exceeds target length {}",
-                m.target_end,
-                tseq.len()
-            );
+            assert!(m.target_start <= m.target_end,
+                "target_start {} exceeds target_end {} (underflow)", m.target_start, m.target_end);
+            assert!(m.target_end <= tseq.len(),
+                "target_end {} exceeds target length {}", m.target_end, tseq.len());
         }
     }
 
     #[test]
     fn test_builder_hpc_override() {
-        let a = Aligner::builder(Preset::MapOnt)
-            .hpc(true)
-            .from_seqs(test_seqs())
-            .unwrap();
+        let a = Aligner::builder(Preset::MapOnt).hpc(true).from_seqs(test_seqs()).unwrap();
         assert!(a.index().homopolymer_compressed);
-        let b = Aligner::builder(Preset::MapPb)
-            .hpc(false)
-            .from_seqs(test_seqs())
-            .unwrap();
+        let b = Aligner::builder(Preset::MapPb).hpc(false).from_seqs(test_seqs()).unwrap();
         assert!(!b.index().homopolymer_compressed);
     }
 
@@ -1881,18 +1377,9 @@ mod tests {
         // Build a tiny index and serialize it (RMMI magic + bincode) into a
         // buffer. Then append junk "footer" bytes after the index.
         let seqs = vec![
-            (
-                "s1".to_string(),
-                b"ACGTACGTACGTACGTACGTACGTACGTACGT".to_vec(),
-            ),
-            (
-                "s2".to_string(),
-                b"TTTTGGGGCCCCAAAATTTTGGGGCCCCAAAA".to_vec(),
-            ),
-            (
-                "s3".to_string(),
-                b"ACGTNNNNACGTACGTACGTACGTNNNNACGT".to_vec(),
-            ),
+            ("s1".to_string(), b"ACGTACGTACGTACGTACGTACGTACGTACGT".to_vec()),
+            ("s2".to_string(), b"TTTTGGGGCCCCAAAATTTTGGGGCCCCAAAA".to_vec()),
+            ("s3".to_string(), b"ACGTNNNNACGTACGTACGTACGTNNNNACGT".to_vec()),
         ];
         let index = Index::build(seqs, 10, 15, false, usize::MAX);
         let mut buf: Vec<u8> = Vec::new();
@@ -1914,18 +1401,8 @@ mod tests {
         assert_eq!(a_trailing.index.seqs.len(), 3);
 
         // Both reader paths agree with each other on the sequence names.
-        let names_b: Vec<&str> = a_bounded
-            .index
-            .seqs
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect();
-        let names_t: Vec<&str> = a_trailing
-            .index
-            .seqs
-            .iter()
-            .map(|t| t.name.as_str())
-            .collect();
+        let names_b: Vec<&str> = a_bounded.index.seqs.iter().map(|t| t.name.as_str()).collect();
+        let names_t: Vec<&str> = a_trailing.index.seqs.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names_b, names_t);
         assert_eq!(names_b, vec!["s1", "s2", "s3"]);
     }
@@ -1936,10 +1413,7 @@ mod tests {
         // that contig and confirm the junction DB is populated and wired in.
         let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
         let mut aligner = Aligner::from_seqs(vec![("ctg1".to_string(), seq)], Preset::Splice);
-        assert!(
-            aligner.junc_db.is_none(),
-            "junctions should be unset before loading"
-        );
+        assert!(aligner.junc_db.is_none(), "junctions should be unset before loading");
 
         // Write a small BED6 file (contig, start, end, name, score, strand).
         let mut path = std::env::temp_dir();
@@ -1949,10 +1423,7 @@ mod tests {
         aligner
             .load_junctions_bed(path.to_str().unwrap())
             .expect("load_junctions_bed should succeed");
-        assert!(
-            aligner.junc_db.is_some(),
-            "junctions should be set after loading"
-        );
+        assert!(aligner.junc_db.is_some(), "junctions should be set after loading");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1966,15 +1437,13 @@ mod tests {
 
         let mut path = std::env::temp_dir();
         path.push(format!("rammap_spsc_test_{}.tsv", std::process::id()));
-        std::fs::write(&path, "ctg1\t10\t+\tD\t5\nctg1\t20\t+\tA\t5\n").expect("write test SPSC");
+        std::fs::write(&path, "ctg1\t10\t+\tD\t5\nctg1\t20\t+\tA\t5\n")
+            .expect("write test SPSC");
 
         aligner
             .load_junctions_spsc(path.to_str().unwrap(), None)
             .expect("load_junctions_spsc should succeed");
-        assert!(
-            aligner.junc_db.is_some(),
-            "junctions should be set after loading SPSC"
-        );
+        assert!(aligner.junc_db.is_some(), "junctions should be set after loading SPSC");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1982,14 +1451,10 @@ mod tests {
     // Deterministic DNA generator (xorshift) for synthetic splice scenarios.
     fn gen_dna(state: &mut u64, n: usize) -> Vec<u8> {
         let bases = [b'A', b'C', b'G', b'T'];
-        (0..n)
-            .map(|_| {
-                *state ^= *state << 13;
-                *state ^= *state >> 7;
-                *state ^= *state << 17;
-                bases[(*state % 4) as usize]
-            })
-            .collect()
+        (0..n).map(|_| {
+            *state ^= *state << 13; *state ^= *state >> 7; *state ^= *state << 17;
+            bases[(*state % 4) as usize]
+        }).collect()
     }
 
     // Target offset of the first intron (N) in a CIGAR = sum of target-consuming
@@ -1998,10 +1463,7 @@ mod tests {
         let mut consumed = 0i32;
         let mut num = String::new();
         for c in cigar.chars() {
-            if c.is_ascii_digit() {
-                num.push(c);
-                continue;
-            }
+            if c.is_ascii_digit() { num.push(c); continue; }
             let len: i32 = num.parse().unwrap_or(0);
             num.clear();
             match c {
@@ -2031,16 +1493,9 @@ mod tests {
         let intron_end = exon1.len() + intron.len();
 
         // Baseline: no junction annotation.
-        let a0 = Aligner::from_seqs(
-            vec![("chr1".to_string(), reference.clone())],
-            Preset::Splice,
-        );
+        let a0 = Aligner::from_seqs(vec![("chr1".to_string(), reference.clone())], Preset::Splice);
         let r0 = a0.map_seq("read", &query);
-        assert_eq!(
-            r0.mappings.len(),
-            1,
-            "expected one mapping without junctions"
-        );
+        assert_eq!(r0.mappings.len(), 1, "expected one mapping without junctions");
         let m0 = &r0.mappings[0];
         let c0 = m0.cigar.clone().expect("cigar present");
 
@@ -2048,56 +1503,33 @@ mod tests {
         let mut a1 = Aligner::from_seqs(vec![("chr1".to_string(), reference)], Preset::Splice);
         let mut path = std::env::temp_dir();
         path.push(format!("rammap_junc_behavior_{}.bed", std::process::id()));
-        std::fs::write(
-            &path,
-            format!("chr1\t{}\t{}\t.\t0\t+\n", intron_start, intron_end),
-        )
-        .expect("write test BED");
-        a1.load_junctions_bed(path.to_str().unwrap())
-            .expect("load_junctions_bed");
+        std::fs::write(&path, format!("chr1\t{}\t{}\t.\t0\t+\n", intron_start, intron_end))
+            .expect("write test BED");
+        a1.load_junctions_bed(path.to_str().unwrap()).expect("load_junctions_bed");
         let _ = std::fs::remove_file(&path);
         let r1 = a1.map_seq("read", &query);
         assert_eq!(r1.mappings.len(), 1, "expected one mapping with junctions");
         let m1 = &r1.mappings[0];
         let c1 = m1.cigar.clone().expect("cigar present");
 
-        assert!(
-            m0.is_spliced && m1.is_spliced,
-            "both alignments should splice (c0={c0}, c1={c1})"
-        );
+        assert!(m0.is_spliced && m1.is_spliced, "both alignments should splice (c0={c0}, c1={c1})");
         // The annotation changed the alignment and improved its score.
         assert_ne!(c0, c1, "junction BED should change the CIGAR (both = {c0})");
-        assert!(
-            m1.score > m0.score,
-            "junction bonus should raise the score: with={} without={}",
-            m1.score,
-            m0.score
-        );
+        assert!(m1.score > m0.score, "junction bonus should raise the score: with={} without={}", m1.score, m0.score);
         // With the annotation the intron snaps exactly to the annotated donor;
         // without it, the splice site is mis-placed.
-        assert_eq!(
-            intron_donor_offset(&c1),
-            Some(intron_start),
-            "annotated splice should sit at the junction (cigar {c1})"
-        );
-        assert_ne!(
-            intron_donor_offset(&c0),
-            Some(intron_start),
-            "unannotated splice should be mis-placed (cigar {c0})"
-        );
+        assert_eq!(intron_donor_offset(&c1), Some(intron_start),
+            "annotated splice should sit at the junction (cigar {c1})");
+        assert_ne!(intron_donor_offset(&c0), Some(intron_start),
+            "unannotated splice should be mis-placed (cigar {c0})");
     }
 
     #[test]
     fn test_preset_as_str_roundtrip() {
         let presets = [
-            Preset::MapOnt,
-            Preset::MapPb,
-            Preset::MapHifi,
-            Preset::Sr,
+            Preset::MapOnt, Preset::MapPb, Preset::MapHifi, Preset::Sr,
             Preset::StrainxpressSrAva,
-            Preset::Splice,
-            Preset::Asm5,
-            Preset::AvaOnt,
+            Preset::Splice, Preset::Asm5, Preset::AvaOnt,
         ];
         for p in &presets {
             let s = p.as_str();
@@ -2108,9 +1540,7 @@ mod tests {
     #[test]
     fn test_apply_preset_sr() {
         let mut opt = MapOptions::default();
-        let mut k = 15;
-        let mut w = 10;
-        let mut is_hpc = false;
+        let mut k = 15; let mut w = 10; let mut is_hpc = false;
         apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, "sr").unwrap();
         assert_eq!(k, 21);
         assert_eq!(w, 11);
@@ -2123,7 +1553,8 @@ mod tests {
         let mut k = 15;
         let mut w = 10;
         let mut is_hpc = false;
-        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, "strainxpress-sr-ava").unwrap();
+        apply_preset_str(&mut opt, &mut k, &mut w, &mut is_hpc, "strainxpress-sr-ava")
+            .unwrap();
         assert_eq!((k, w, is_hpc), (21, 11, false));
         assert_eq!(
             opt.flags,
@@ -2144,9 +1575,7 @@ mod tests {
 
     #[test]
     fn test_map_result_empty() {
-        let result = MapResult {
-            mappings: Vec::new(),
-        };
+        let result = MapResult { mappings: Vec::new() };
         assert!(result.mappings.is_empty());
     }
 
@@ -2171,10 +1600,7 @@ mod tests {
     fn test_dp_align_identical() {
         let seq = encode_nt4(b"ACGTACGTACGT");
         let result = dp_align(&seq, &seq, &DpScoring::default(), -1);
-        assert!(
-            result.score > 0,
-            "identical seqs should have positive score"
-        );
+        assert!(result.score > 0, "identical seqs should have positive score");
         assert_eq!(result.cigar, "12M");
     }
 
@@ -2190,14 +1616,10 @@ mod tests {
 
     #[test]
     fn test_dp_align_with_insertion() {
-        let query = encode_nt4(b"ACGTAAAACGT");
+        let query  = encode_nt4(b"ACGTAAAACGT");
         let target = encode_nt4(b"ACGTACGT");
         let result = dp_align(&query, &target, &DpScoring::default(), -1);
-        assert!(
-            result.cigar.contains('I'),
-            "should contain insertion: {}",
-            result.cigar
-        );
+        assert!(result.cigar.contains('I'), "should contain insertion: {}", result.cigar);
     }
 
     #[test]
@@ -2213,84 +1635,36 @@ mod tests {
 
     #[test]
     fn test_dp_global_with_indel() {
-        let query = encode_nt4(b"ACGTAAACGT");
+        let query  = encode_nt4(b"ACGTAAACGT");
         let target = encode_nt4(b"ACGTACGT");
         let result = dp_global(&query, &target, &DpScoring::default(), -1);
         // Must cover both sequences end-to-end
-        let total_q: usize = result
-            .cigar
-            .chars()
-            .filter(|c| !c.is_ascii_digit())
-            .zip(
-                result
-                    .cigar
-                    .split(|c: char| !c.is_ascii_digit())
-                    .filter(|s| !s.is_empty()),
-            )
-            .map(|(op, len)| {
-                let l: usize = len.parse().unwrap();
-                if op == 'D' {
-                    0
-                } else {
-                    l
-                }
-            })
-            .sum();
-        let total_t: usize = result
-            .cigar
-            .chars()
-            .filter(|c| !c.is_ascii_digit())
-            .zip(
-                result
-                    .cigar
-                    .split(|c: char| !c.is_ascii_digit())
-                    .filter(|s| !s.is_empty()),
-            )
-            .map(|(op, len)| {
-                let l: usize = len.parse().unwrap();
-                if op == 'I' {
-                    0
-                } else {
-                    l
-                }
-            })
-            .sum();
-        assert_eq!(
-            total_q, 10,
-            "CIGAR should consume full query (10bp): cigar={}",
-            result.cigar
-        );
-        assert_eq!(
-            total_t, 8,
-            "CIGAR should consume full target (8bp): cigar={}",
-            result.cigar
-        );
+        let total_q: usize = result.cigar.chars().filter(|c| !c.is_ascii_digit())
+            .zip(result.cigar.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()))
+            .map(|(op, len)| { let l: usize = len.parse().unwrap(); if op == 'D' { 0 } else { l } }).sum();
+        let total_t: usize = result.cigar.chars().filter(|c| !c.is_ascii_digit())
+            .zip(result.cigar.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()))
+            .map(|(op, len)| { let l: usize = len.parse().unwrap(); if op == 'I' { 0 } else { l } }).sum();
+        assert_eq!(total_q, 10, "CIGAR should consume full query (10bp): cigar={}", result.cigar);
+        assert_eq!(total_t, 8, "CIGAR should consume full target (8bp): cigar={}", result.cigar);
     }
 
     #[test]
     fn test_dp_local_finds_best_region() {
         // Embed a matching region in noise
-        let query = encode_nt4(b"TTTTACGTACGTACGTTTTT");
+        let query  = encode_nt4(b"TTTTACGTACGTACGTTTTT");
         let target = encode_nt4(b"GGGGACGTACGTACGTGGGG");
         let result = dp_local(&query, &target, &DpScoring::default());
         assert!(result.score > 0);
         // Local alignment should find the ACGTACGTACGT match, not the flanking noise
-        assert!(
-            result.query_start >= 3,
-            "should skip noise prefix: qs={}",
-            result.query_start
-        );
-        assert!(
-            result.query_end <= 16,
-            "should skip noise suffix: qe={}",
-            result.query_end
-        );
+        assert!(result.query_start >= 3, "should skip noise prefix: qs={}", result.query_start);
+        assert!(result.query_end <= 16, "should skip noise suffix: qe={}", result.query_end);
     }
 
     #[test]
     fn test_dp_extension() {
         // Extension aligns from position 0, stopping at the best score
-        let query = encode_nt4(b"ACGTACGTACGTACGTACGTACGTACGTACGTCGATCGATCGATCGATCG");
+        let query  = encode_nt4(b"ACGTACGTACGTACGTACGTACGTACGTACGTCGATCGATCGATCGATCG");
         let target = encode_nt4(b"ACGTACGTACGTACGTACGTACGTACGTACGTTTTTTTTTTTTTTTTTTTT");
         let result = dp_extension(&query, &target, &DpScoring::default(), -1);
         // Should produce a valid alignment with CIGAR
@@ -2302,12 +1676,9 @@ mod tests {
         let query = encode_nt4(b"ACGTACGT");
         let target = encode_nt4(b"ACGTACGT");
         let scoring = DpScoring {
-            match_score: 2,
-            mismatch: 4,
-            gap_open: 4,
-            gap_extend: 2,
-            gap_open2: 24,
-            gap_extend2: 1,
+            match_score: 2, mismatch: 4,
+            gap_open: 4, gap_extend: 2,
+            gap_open2: 24, gap_extend2: 1,
         };
         let result = dp_align(&query, &target, &scoring, -1);
         assert_eq!(result.score, 16); // 8 * 2
