@@ -21,6 +21,17 @@ use crate::align::index::Index;
 use crate::align::map::{MapOptions, AlignFlags};
 use crate::align::sketch::{SEED_SEG_SHIFT, SEED_SELF};
 
+/// Read-only global occurrence lookup supplied by a partition transaction.
+/// `local_count` is retained for allocation and retrieval; implementations
+/// return the authenticated global count for filtering and seed selection.
+pub trait OccurrencePolicy {
+    /// Return the globally retained occurrence count. `None` means that the
+    /// hash is absent from the conceptual monolithic index (including a
+    /// globally capped hash). Implementations must retain any I/O failure in
+    /// their own state so the enclosing transaction can fail closed.
+    fn global_count(&self, hash: u64) -> Option<usize>;
+}
+
 // Hash functions
 #[inline]
 pub(crate) fn hash64(mut key: u64) -> u64 {
@@ -71,7 +82,8 @@ struct SeedInfo {
     is_tandem: bool,
     is_filtered: bool,      // true = filtered out
     mi_idx: usize,  // index into q_minimizers
-    entry_range: (u32, u32), // absolute range into Index.entries
+    entry_range: Option<(u32, u32)>, // absent when the global policy has no local hits
+    local_hit_count: usize,
 }
 
 /// Select seeds by frequency threshold
@@ -208,6 +220,7 @@ fn collect_anchor_matches(
     mini_pos: &mut Vec<u64>,
     max_occ: usize,
     scratch: &mut SeedScratch,
+    policy: Option<&dyn OccurrencePolicy>,
 ) -> (usize, usize) {
     mini_pos.clear();
 
@@ -248,11 +261,21 @@ fn collect_anchor_matches(
         let hash = m.x >> 8;
         let q_span = (m.x & 0xFF) as u32;
         let q_pos = m.y as u32; // includes strand bit
-        let range = match mi.get_range(hash) {
-            Some(r) => r,
-            None => continue,
+        let range = mi.get_range(hash);
+        let local_n = range.map_or(0, |r| (r.1 - r.0) as usize);
+        let n = match policy {
+            None => local_n,
+            Some(p) => match p.global_count(hash) {
+                Some(count) => count,
+                None => continue,
+            },
         };
-        let n = (range.1 - range.0) as usize;
+        // A globally repetitive seed absent from this shard still participates
+        // in deterministic high-occurrence selection and repetitive-length
+        // calculation, but cannot contribute local anchors.
+        if range.is_none() && n <= max_occ {
+            continue;
+        }
         seeds.push(SeedInfo {
             query_pos: q_pos,
             q_span,
@@ -261,6 +284,7 @@ fn collect_anchor_matches(
             is_filtered: false,
             mi_idx,
             entry_range: range,
+            local_hit_count: local_n,
         });
     }
 
@@ -296,15 +320,17 @@ fn collect_anchor_matches(
             continue;
         }
 
-        n_a += seed.hit_count;
-        mini_pos.push(((seed.q_span as u64) << 32) | ((seed.query_pos >> 1) as u64));
-        matched_seeds.push(MatchedSeed {
-            q_span: seed.q_span,
-            is_tandem: seed.is_tandem,
-            mi_idx: seed.mi_idx,
-            seg_id: (q_minimizers[seed.mi_idx].y >> 32),
-            entry_range: seed.entry_range,
-        });
+        if let Some(entry_range) = seed.entry_range {
+            n_a += seed.local_hit_count;
+            mini_pos.push(((seed.q_span as u64) << 32) | ((seed.query_pos >> 1) as u64));
+            matched_seeds.push(MatchedSeed {
+                q_span: seed.q_span,
+                is_tandem: seed.is_tandem,
+                mi_idx: seed.mi_idx,
+                seg_id: (q_minimizers[seed.mi_idx].y >> 32),
+                entry_range,
+            });
+        }
     }
 
     rep_len += rep_en - rep_st;
@@ -324,8 +350,23 @@ pub(crate) fn collect_seed_hits_with_occ(
     qname: Option<&str>,
     scratch: &mut SeedScratch,
 ) -> usize {
+    collect_seed_hits_with_occ_policy(opt, mi, qlen, q_minimizers, anchors, mini_pos, max_occ, qname, scratch, None)
+}
+
+pub(crate) fn collect_seed_hits_with_occ_policy(
+    opt: &MapOptions,
+    mi: &Index,
+    qlen: usize,
+    q_minimizers: &[Minimizer],
+    anchors: &mut Vec<Minimizer>,
+    mini_pos: &mut Vec<u64>,
+    max_occ: usize,
+    qname: Option<&str>,
+    scratch: &mut SeedScratch,
+    policy: Option<&dyn OccurrencePolicy>,
+) -> usize {
     anchors.clear();
-    let (n_a, rep_len) = collect_anchor_matches(opt, mi, qlen, q_minimizers, mini_pos, max_occ, scratch);
+    let (n_a, rep_len) = collect_anchor_matches(opt, mi, qlen, q_minimizers, mini_pos, max_occ, scratch, policy);
     anchors.reserve(n_a);
 
     let seed_tandem: u64 = crate::align::sketch::SEED_TANDEM;
@@ -439,7 +480,21 @@ pub fn collect_seed_hits(
     qname: Option<&str>,
     scratch: &mut SeedScratch,
 ) -> usize {
-    collect_seed_hits_with_occ(opt, mi, qlen, q_minimizers, anchors, mini_pos, opt.seeding.mid_occ, qname, scratch)
+    collect_seed_hits_with_occ_policy(opt, mi, qlen, q_minimizers, anchors, mini_pos, opt.seeding.mid_occ, qname, scratch, None)
+}
+
+pub(crate) fn collect_seed_hits_policy(
+    opt: &MapOptions,
+    mi: &Index,
+    qlen: usize,
+    q_minimizers: &[Minimizer],
+    anchors: &mut Vec<Minimizer>,
+    mini_pos: &mut Vec<u64>,
+    qname: Option<&str>,
+    scratch: &mut SeedScratch,
+    policy: Option<&dyn OccurrencePolicy>,
+) -> usize {
+    collect_seed_hits_with_occ_policy(opt, mi, qlen, q_minimizers, anchors, mini_pos, opt.seeding.mid_occ, qname, scratch, policy)
 }
 
 // --- Heap-based seed collection ---
@@ -490,8 +545,23 @@ pub fn collect_seed_hits_heap(
     qname: Option<&str>,
     scratch: &mut SeedScratch,
 ) -> usize {
+    collect_seed_hits_heap_policy(opt, mi, qlen, q_minimizers, anchors, mini_pos, max_occ, qname, scratch, None)
+}
+
+pub(crate) fn collect_seed_hits_heap_policy(
+    opt: &MapOptions,
+    mi: &Index,
+    qlen: usize,
+    q_minimizers: &[Minimizer],
+    anchors: &mut Vec<Minimizer>,
+    mini_pos: &mut Vec<u64>,
+    max_occ: usize,
+    qname: Option<&str>,
+    scratch: &mut SeedScratch,
+    policy: Option<&dyn OccurrencePolicy>,
+) -> usize {
     anchors.clear();
-    let (n_a, rep_len) = collect_anchor_matches(opt, mi, qlen, q_minimizers, mini_pos, max_occ, scratch);
+    let (n_a, rep_len) = collect_anchor_matches(opt, mi, qlen, q_minimizers, mini_pos, max_occ, scratch, policy);
     if n_a == 0 { return rep_len; }
 
     anchors.resize(n_a, Minimizer { x: 0, y: 0 });

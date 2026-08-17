@@ -7,7 +7,11 @@
 
 use super::extend::AlignmentContext;
 use super::index::{Index, TargetSequence};
-use super::map::{MapContext, MapOptions, map_query};
+use super::map::{MapContext, MapOptions, map_query_with_policy};
+use super::global_occurrence_policy::{
+    GlobalOccurrencePolicy, GlobalOccurrencePolicyFacts, GlobalOccurrencePolicyMetadata,
+    GlobalOccurrencePolicyWriter, GlobalOccurrenceRecord,
+};
 use super::occurrence_sidecar::{
     OccurrenceRecord, OccurrenceSidecarMetadata, OccurrenceSidecarReader, OccurrenceSidecarWriter,
 };
@@ -24,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 const MAX_CALIBRATION_BINS: usize = 16 * 1024 * 1024;
 const PARTITION_MANIFEST_MAGIC: &[u8; 4] = b"RXPM";
-const PARTITION_MANIFEST_VERSION: u32 = 1;
+const PARTITION_MANIFEST_VERSION: u32 = 2;
 const STAGE_INIT: u8 = 0;
 const STAGE_SIDECARS: u8 = 1;
 const STAGE_RAW: u8 = 2;
@@ -61,6 +65,10 @@ pub struct PartitionedMapReceipt {
     pub query_count: u64,
     pub mid_occ: usize,
     pub output_bytes: u64,
+    pub output_checksum: u64,
+    pub policy_bytes: u64,
+    pub policy_checksum: u64,
+    pub policy_records: u64,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -125,6 +133,11 @@ fn create_new(path: &Path) -> io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
 fn occurrence_metadata(
     config: &PartitionedMapConfig,
     shard_id: u32,
@@ -175,6 +188,10 @@ fn manifest_path(config: &PartitionedMapConfig) -> PathBuf {
     config.spool_dir.join("partitioned.manifest")
 }
 
+fn global_policy_path(config: &PartitionedMapConfig) -> PathBuf {
+    config.spool_dir.join("global-occurrence.rxgp")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PartitionManifest {
     shard_count: u32,
@@ -185,6 +202,9 @@ struct PartitionManifest {
     mid_occ: u64,
     query_count: u64,
     completed_raw: u32,
+    policy_bytes: u64,
+    policy_checksum: u64,
+    policy_records: u64,
     output_bytes: u64,
     output_checksum: u64,
 }
@@ -200,6 +220,9 @@ impl PartitionManifest {
             mid_occ: 0,
             query_count: 0,
             completed_raw: 0,
+            policy_bytes: 0,
+            policy_checksum: 0,
+            policy_records: 0,
             output_bytes: 0,
             output_checksum: 0,
         }
@@ -216,7 +239,9 @@ impl PartitionManifest {
         if self.stage > STAGE_COMPLETE || self.completed_raw > shard_count {
             return Err(invalid("partitioned resume manifest stage is invalid"));
         }
-        if self.stage >= STAGE_SIDECARS && self.mid_occ == 0 {
+        if self.stage >= STAGE_SIDECARS
+            && (self.mid_occ == 0 || self.policy_bytes == 0 || self.policy_checksum == 0)
+        {
             return Err(invalid("partitioned resume manifest has no mid_occ"));
         }
         if self.stage >= STAGE_RAW && self.completed_raw != shard_count {
@@ -245,6 +270,9 @@ fn encode_manifest(manifest: PartitionManifest) -> Vec<u8> {
     bytes.extend_from_slice(&manifest.mid_occ.to_le_bytes());
     bytes.extend_from_slice(&manifest.query_count.to_le_bytes());
     bytes.extend_from_slice(&manifest.completed_raw.to_le_bytes());
+    bytes.extend_from_slice(&manifest.policy_bytes.to_le_bytes());
+    bytes.extend_from_slice(&manifest.policy_checksum.to_le_bytes());
+    bytes.extend_from_slice(&manifest.policy_records.to_le_bytes());
     bytes.extend_from_slice(&manifest.output_bytes.to_le_bytes());
     bytes.extend_from_slice(&manifest.output_checksum.to_le_bytes());
     let checksum = checksum_update(FNV_OFFSET, &bytes);
@@ -303,6 +331,9 @@ fn load_manifest(path: &Path) -> io::Result<PartitionManifest> {
     let mid_occ = take_u64(&bytes, &mut offset)?;
     let query_count = take_u64(&bytes, &mut offset)?;
     let completed_raw = take_u32(&bytes, &mut offset)?;
+    let policy_bytes = take_u64(&bytes, &mut offset)?;
+    let policy_checksum = take_u64(&bytes, &mut offset)?;
+    let policy_records = take_u64(&bytes, &mut offset)?;
     let output_bytes = take_u64(&bytes, &mut offset)?;
     let output_checksum = take_u64(&bytes, &mut offset)?;
     if offset != bytes.len() - 8 {
@@ -317,6 +348,9 @@ fn load_manifest(path: &Path) -> io::Result<PartitionManifest> {
         mid_occ,
         query_count,
         completed_raw,
+        policy_bytes,
+        policy_checksum,
+        policy_records,
         output_bytes,
         output_checksum,
     })
@@ -333,6 +367,7 @@ fn write_manifest(path: &Path, manifest: PartitionManifest) -> io::Result<()> {
     file.write_all(&encode_manifest(manifest))?;
     file.sync_all()?;
     fs::rename(temporary, path)?;
+    sync_parent(path)?;
     Ok(())
 }
 
@@ -377,6 +412,7 @@ fn write_index_artifact(
     file.write_all(&payload_checksum.to_le_bytes())?;
     file.sync_all()?;
     fs::rename(temporary, path)?;
+    sync_parent(path)?;
     Ok(())
 }
 
@@ -531,6 +567,7 @@ fn build_occurrence_sidecars(config: &PartitionedMapConfig) -> io::Result<()> {
             .map_err(|error| io::Error::other(error.to_string()))?
             .sync_all()?;
         fs::rename(temporary, sidecar)?;
+        sync_parent(&sidecar)?;
     }
     Ok(())
 }
@@ -542,6 +579,35 @@ fn validate_sidecars(config: &PartitionedMapConfig, shard_count: u32) -> io::Res
         OccurrenceSidecarReader::new(BufReader::new(file), Some(&expected))?.finish()?;
     }
     Ok(())
+}
+
+fn global_policy_metadata(
+    config: &PartitionedMapConfig,
+    shard_count: u32,
+) -> GlobalOccurrencePolicyMetadata {
+    GlobalOccurrencePolicyMetadata {
+        bucket_bits: 10u32.min((2 * config.k) as u32),
+        shard_count,
+        parameter_digest: config.parameter_digest,
+        target_digest: config.target_digest,
+    }
+}
+
+fn open_global_policy(
+    config: &PartitionedMapConfig,
+    shard_count: u32,
+    expected: Option<GlobalOccurrencePolicyFacts>,
+) -> io::Result<GlobalOccurrencePolicy> {
+    let policy = GlobalOccurrencePolicy::open(
+        &global_policy_path(config),
+        &global_policy_metadata(config, shard_count),
+    )?;
+    if let Some(expected) = expected {
+        if policy.facts() != expected {
+            return Err(invalid("global occurrence policy facts do not match the manifest"));
+        }
+    }
+    Ok(policy)
 }
 
 fn validate_raw_spool(
@@ -580,10 +646,30 @@ fn output_stats(path: &Path) -> io::Result<(u64, u64)> {
     Ok((length, checksum))
 }
 
-fn calibrated_mid_occ(config: &PartitionedMapConfig, sidecar_count: u32) -> io::Result<usize> {
+fn build_global_occurrence_policy(
+    config: &PartitionedMapConfig,
+    sidecar_count: u32,
+) -> io::Result<(usize, GlobalOccurrencePolicyFacts)> {
     let max_mid = config.options.seeding.max_mid_occ.max(1) as usize;
     let histogram_max = config.index_max_occ.min(max_mid);
     let mut histogram = vec![0u64; histogram_max + 1];
+    let policy = global_policy_path(config);
+    if policy.exists() {
+        return Err(invalid(
+            "global occurrence policy exists before its manifest stage",
+        ));
+    }
+    let temporary = partial_path(&policy);
+    if temporary.exists() {
+        fs::remove_file(&temporary)?;
+    }
+    let metadata = GlobalOccurrencePolicyMetadata {
+        bucket_bits: 10u32.min((2 * config.k) as u32),
+        shard_count: sidecar_count,
+        parameter_digest: config.parameter_digest,
+        target_digest: config.target_digest,
+    };
+    let mut policy_writer = GlobalOccurrencePolicyWriter::create(&temporary, metadata)?;
     let mut readers = Vec::with_capacity(sidecar_count as usize);
     for shard_id in 0..sidecar_count {
         let path = sidecar_path(config, shard_id);
@@ -626,6 +712,18 @@ fn calibrated_mid_occ(config: &PartitionedMapConfig, sidecar_count: u32) -> io::
                 )));
             }
         }
+        // The partition index must expose exactly the hashes retained by a
+        // conceptual monolithic index. A hash above the global cap is absent
+        // from that index, even when its local count is below the cap.
+        if config.index_max_occ == usize::MAX
+            || total <= config.index_max_occ as u64
+        {
+            policy_writer.write_record(GlobalOccurrenceRecord {
+                bucket,
+                hash,
+                count: total,
+            })?;
+        }
         if config.index_max_occ == usize::MAX || total <= config.index_max_occ as u64 {
             let bin = (total as usize).min(histogram_max);
             histogram[bin] = histogram[bin]
@@ -634,12 +732,16 @@ fn calibrated_mid_occ(config: &PartitionedMapConfig, sidecar_count: u32) -> io::
         }
     }
 
+    let facts = policy_writer.finish()?;
+    fs::rename(&temporary, &policy)?;
+    sync_parent(&policy)?;
+
     if config.mid_occ_frac <= 0.0 {
-        return Ok(usize::MAX);
+        return Ok((usize::MAX, facts));
     }
     let retained = histogram.iter().sum::<u64>();
     if retained == 0 {
-        return Ok(config.options.seeding.min_mid_occ.max(1) as usize);
+        return Ok((config.options.seeding.min_mid_occ.max(1) as usize, facts));
     }
     let rank = (((1.0f64 - config.mid_occ_frac as f64) * retained as f64) as u64).min(retained - 1);
     let mut seen = 0u64;
@@ -657,7 +759,7 @@ fn calibrated_mid_occ(config: &PartitionedMapConfig, sidecar_count: u32) -> io::
     if config.options.seeding.max_mid_occ > config.options.seeding.min_mid_occ {
         threshold = threshold.min(max_mid);
     }
-    Ok(threshold)
+    Ok((threshold, facts))
 }
 
 fn map_shard_to_raw(
@@ -665,6 +767,7 @@ fn map_shard_to_raw(
     shard_id: u32,
     shard_count: u32,
     mid_occ: usize,
+    policy: &GlobalOccurrencePolicy,
 ) -> io::Result<(u64, Vec<TargetSequence>)> {
     let index = load_index_artifact(config, shard_id, shard_count)?;
     let target_metadata = index.seqs.clone();
@@ -706,12 +809,13 @@ fn map_shard_to_raw(
                 stats: Default::default(),
             }
         } else {
-            let (regs, rep_len, stats, squeezed) = map_query(
+            let (regs, rep_len, stats, squeezed) = map_query_with_policy(
                 &options,
                 &index,
                 record.name(),
                 record.sequence(),
                 &mut map_ctx,
+                Some(policy),
             );
             align_query_raw(
                 &options,
@@ -734,12 +838,15 @@ fn map_shard_to_raw(
             .checked_add(1)
             .ok_or_else(|| invalid("query ordinal overflow"))?;
     }
+    policy.ensure_valid()?;
     let buffered = writer.finish()?;
     buffered
         .into_inner()
         .map_err(|error| io::Error::other(error.to_string()))?
         .sync_all()?;
     fs::rename(temporary, raw)?;
+    sync_parent(&raw)?;
+    policy.ensure_valid()?;
     Ok((ordinal, target_metadata))
 }
 
@@ -792,6 +899,7 @@ fn merge_to_partial(
     )?;
     let mut query_count = 0u64;
     while let Some(record) = query_reader.read_next().map_err(io::Error::other)? {
+        let mut observed_rep_len = None;
         let mut merged = RawQuery {
             results: Vec::new(),
             recalc_infos: Vec::new(),
@@ -810,10 +918,15 @@ fn merge_to_partial(
                     "raw spool query identity does not match the query stream",
                 ));
             }
-            merged.rep_len = merged
-                .rep_len
-                .checked_add(frame.raw.rep_len)
-                .ok_or_else(|| invalid("merged repetitive length overflow"))?;
+            if let Some(expected_rep_len) = observed_rep_len {
+                if expected_rep_len != frame.raw.rep_len {
+                    return Err(invalid(
+                        "shards produced different global repetitive lengths",
+                    ));
+                }
+            } else {
+                observed_rep_len = Some(frame.raw.rep_len);
+            }
             for mut result in frame.raw.results {
                 result.ref_id = result
                     .ref_id
@@ -823,6 +936,7 @@ fn merge_to_partial(
             }
             merged.recalc_infos.extend(frame.raw.recalc_infos);
         }
+        merged.rep_len = observed_rep_len.unwrap_or(0);
         let processed = finalize_raw_query(
             merged,
             &options,
@@ -888,6 +1002,7 @@ fn publish_partial_output(config: &PartitionedMapConfig, expected: (u64, u64)) -
         ));
     }
     fs::rename(temporary, &config.output_path)?;
+    sync_parent(&config.output_path)?;
     Ok(())
 }
 
@@ -925,6 +1040,15 @@ pub fn map_partitioned_fasta_to_paf(
     };
 
     if manifest.stage == STAGE_COMPLETE {
+        let expected_policy = GlobalOccurrencePolicyFacts {
+            bytes: manifest.policy_bytes,
+            checksum: manifest.policy_checksum,
+            record_count: manifest.policy_records,
+        };
+        let policy = open_global_policy(config, shard_count, None)?;
+        if policy.facts() != expected_policy {
+            return Err(invalid("completed policy facts do not match its manifest"));
+        }
         let observed = output_stats(&config.output_path)?;
         if observed != (manifest.output_bytes, manifest.output_checksum) {
             return Err(invalid(
@@ -936,10 +1060,21 @@ pub fn map_partitioned_fasta_to_paf(
             query_count: manifest.query_count,
             mid_occ: manifest.mid_occ as usize,
             output_bytes: manifest.output_bytes,
+            output_checksum: manifest.output_checksum,
+            policy_bytes: manifest.policy_bytes,
+            policy_checksum: manifest.policy_checksum,
+            policy_records: manifest.policy_records,
         });
     }
 
     if manifest.stage == STAGE_OUTPUT_READY {
+        let policy = open_global_policy(config, shard_count, None)?;
+        if policy.facts().bytes != manifest.policy_bytes
+            || policy.facts().checksum != manifest.policy_checksum
+            || policy.facts().record_count != manifest.policy_records
+        {
+            return Err(invalid("output-ready policy facts do not match its manifest"));
+        }
         let expected = (manifest.output_bytes, manifest.output_checksum);
         if config.output_path.exists() {
             if output_stats(&config.output_path)? != expected {
@@ -957,18 +1092,35 @@ pub fn map_partitioned_fasta_to_paf(
             query_count: manifest.query_count,
             mid_occ: manifest.mid_occ as usize,
             output_bytes: manifest.output_bytes,
+            output_checksum: manifest.output_checksum,
+            policy_bytes: manifest.policy_bytes,
+            policy_checksum: manifest.policy_checksum,
+            policy_records: manifest.policy_records,
         });
     }
 
-    if manifest.stage >= STAGE_SIDECARS {
+    let policy = if manifest.stage >= STAGE_SIDECARS {
         validate_sidecars(config, shard_count)?;
+        open_global_policy(
+            config,
+            shard_count,
+            Some(GlobalOccurrencePolicyFacts {
+                bytes: manifest.policy_bytes,
+                checksum: manifest.policy_checksum,
+                record_count: manifest.policy_records,
+            }),
+        )?
     } else {
         build_occurrence_sidecars(config)?;
-        let mid_occ = calibrated_mid_occ(config, shard_count)?;
+        let (mid_occ, facts) = build_global_occurrence_policy(config, shard_count)?;
         manifest.stage = STAGE_SIDECARS;
         manifest.mid_occ = mid_occ as u64;
+        manifest.policy_bytes = facts.bytes;
+        manifest.policy_checksum = facts.checksum;
+        manifest.policy_records = facts.record_count;
         write_manifest(&manifest_file, manifest)?;
-    }
+        open_global_policy(config, shard_count, Some(facts))?
+    };
     let mid_occ = usize::try_from(manifest.mid_occ)
         .map_err(|_| invalid("partitioned resume mid_occ exceeds usize"))?;
     let mut all_seqs = Vec::new();
@@ -1015,7 +1167,7 @@ pub fn map_partitioned_fasta_to_paf(
             query_count
         } else {
             let (query_count, target_metadata) =
-                map_shard_to_raw(config, shard_id, shard_count, mid_occ)?;
+                map_shard_to_raw(config, shard_id, shard_count, mid_occ, &policy)?;
             append_target_metadata(
                 &mut all_seqs,
                 &mut ref_offsets,
@@ -1070,6 +1222,10 @@ pub fn map_partitioned_fasta_to_paf(
         query_count,
         mid_occ,
         output_bytes,
+        output_checksum,
+        policy_bytes: manifest.policy_bytes,
+        policy_checksum: manifest.policy_checksum,
+        policy_records: manifest.policy_records,
     })
 }
 

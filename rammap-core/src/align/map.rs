@@ -37,7 +37,7 @@ use crate::align::chain_rmq::chain_anchors_rmq;
 use crate::align::sort::radix_sort_128x;
 use crate::align::filter::{FilterParams, ParentState, Filterable, check_secondary_filter, scale_alt_score};
 
-use crate::align::seed::{hash64, compute_read_hash, collect_seed_hits, collect_seed_hits_with_occ, collect_seed_hits_heap, filter_minimizers_by_occ};
+use crate::align::seed::{hash64, compute_read_hash, collect_seed_hits_policy, collect_seed_hits_with_occ_policy, collect_seed_hits_heap_policy, filter_minimizers_by_occ, OccurrencePolicy};
 
 // Behavioral flag constants
 bitflags! {
@@ -967,8 +967,6 @@ pub struct MultiMapResult {
     pub stats: AlignmentStats,
 }
 
-/// Map multiple query segments using combined minimizer collection and chaining.
-/// This is the "strong pairing" path.
 pub fn map_query_multi(
     opt: &MapOptions,
     mi: &Index,
@@ -976,6 +974,20 @@ pub fn map_query_multi(
     seqs: &[&[u8]],
     qlens: &[usize],
     ctx: &mut MapContext,
+) -> MultiMapResult {
+    map_query_multi_with_policy(opt, mi, qname, seqs, qlens, ctx, None)
+}
+
+/// Map multiple query segments using combined minimizer collection and chaining.
+/// This is the "strong pairing" path.
+pub fn map_query_multi_with_policy(
+    opt: &MapOptions,
+    mi: &Index,
+    qname: &str,
+    seqs: &[&[u8]],
+    qlens: &[usize],
+    ctx: &mut MapContext,
+    policy: Option<&dyn OccurrencePolicy>,
 ) -> MultiMapResult {
     let n_segs = seqs.len();
     let mut stats = AlignmentStats { n_reads: n_segs, ..Default::default() };
@@ -998,9 +1010,9 @@ pub fn map_query_multi(
     ctx.mini_pos.clear();
     let qn_opt = Some(qname);
     let mut rep_len = if opt.flags.contains(AlignFlags::HEAP_SORT) {
-        collect_seed_hits_heap(opt, mi, qlen_sum, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.mid_occ, qn_opt, &mut ctx.seed_scratch)
+        collect_seed_hits_heap_policy(opt, mi, qlen_sum, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.mid_occ, qn_opt, &mut ctx.seed_scratch, policy)
     } else {
-        collect_seed_hits(opt, mi, qlen_sum, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, qn_opt, &mut ctx.seed_scratch)
+        collect_seed_hits_policy(opt, mi, qlen_sum, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, qn_opt, &mut ctx.seed_scratch, policy)
     };
     stats.t_seed = t1.elapsed();
     stats.n_anchors = ctx.anchors.len();
@@ -1100,9 +1112,9 @@ pub fn map_query_multi(
 
         if rechain {
             rep_len = if opt.flags.contains(AlignFlags::HEAP_SORT) {
-                collect_seed_hits_heap(opt, mi, qlen_sum, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.max_occ, qn_opt, &mut ctx.seed_scratch)
+                collect_seed_hits_heap_policy(opt, mi, qlen_sum, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.max_occ, qn_opt, &mut ctx.seed_scratch, policy)
             } else {
-                collect_seed_hits_with_occ(opt, mi, qlen_sum, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.max_occ, qn_opt, &mut ctx.seed_scratch)
+                collect_seed_hits_with_occ_policy(opt, mi, qlen_sum, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.max_occ, qn_opt, &mut ctx.seed_scratch, policy)
             };
 
             let mut anchors = std::mem::take(&mut ctx.anchors);
@@ -1282,6 +1294,17 @@ pub fn map_query(
     qseq: &[u8],
     ctx: &mut MapContext,
 ) -> (Vec<Mapping>, usize, AlignmentStats, Vec<Minimizer>) {
+    map_query_with_policy(opt, mi, qname, qseq, ctx, None)
+}
+
+pub fn map_query_with_policy(
+    opt: &MapOptions,
+    mi: &Index,
+    qname: &str,
+    qseq: &[u8],
+    ctx: &mut MapContext,
+    policy: Option<&dyn OccurrencePolicy>,
+) -> (Vec<Mapping>, usize, AlignmentStats, Vec<Minimizer>) {
     let mut stats = AlignmentStats { n_reads: 1, ..Default::default() };
 
     let qlen = qseq.len();
@@ -1304,9 +1327,9 @@ pub fn map_query(
     ctx.mini_pos.clear();
     let qn_opt = Some(qname);
     let mut rep_len = if opt.flags.contains(AlignFlags::HEAP_SORT) {
-        collect_seed_hits_heap(opt, mi, qlen, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.mid_occ, qn_opt, &mut ctx.seed_scratch)
+        collect_seed_hits_heap_policy(opt, mi, qlen, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.mid_occ, qn_opt, &mut ctx.seed_scratch, policy)
     } else {
-        collect_seed_hits(opt, mi, qlen, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, qn_opt, &mut ctx.seed_scratch)
+        collect_seed_hits_policy(opt, mi, qlen, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, qn_opt, &mut ctx.seed_scratch, policy)
     };
     stats.t_seed = t1.elapsed();
     stats.n_anchors = ctx.anchors.len();
@@ -1402,9 +1425,9 @@ pub fn map_query(
 
         if rechain {
             rep_len = if opt.flags.contains(AlignFlags::HEAP_SORT) {
-                collect_seed_hits_heap(opt, mi, qlen, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.max_occ, qn_opt, &mut ctx.seed_scratch)
+                collect_seed_hits_heap_policy(opt, mi, qlen, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.max_occ, qn_opt, &mut ctx.seed_scratch, policy)
             } else {
-                collect_seed_hits_with_occ(opt, mi, qlen, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.max_occ, qn_opt, &mut ctx.seed_scratch)
+                collect_seed_hits_with_occ_policy(opt, mi, qlen, &ctx.minimizers, &mut ctx.anchors, &mut ctx.mini_pos, opt.seeding.max_occ, qn_opt, &mut ctx.seed_scratch, policy)
             };
 
             let mut anchors = std::mem::take(&mut ctx.anchors);
