@@ -243,9 +243,7 @@ impl IndexBuilder {
         // next sequence arrives.
     }
 
-    /// Finalize: sort buckets, build the per-bucket hash backend, attach to
-    /// the index, and return it.
-    pub fn finish(mut self) -> Index {
+    fn sort_buckets(&mut self) {
         #[cfg(feature = "parallel")]
         self.buckets.par_iter_mut().for_each(|b| {
             if !b.is_empty() { b.sort_unstable(); }
@@ -254,12 +252,46 @@ impl IndexBuilder {
         for b in self.buckets.iter_mut() {
             if !b.is_empty() { b.sort_unstable(); }
         }
+    }
+
+    fn finish_index(mut self) -> Index {
 
         self.idx.backend = LookupBackend::BucketHash(
             super::index_bucket::BucketHashLookup::build(self.bucket_bits, &mut self.buckets, self.max_occ)
         );
         self.idx.packed_seqs = self.packed;
         self.idx
+    }
+
+    /// Finalize while exposing pre-cap occurrence counts in bounded, bucket-
+    /// sorted order. The callback is invoked once per unique minimizer hash
+    /// as `(bucket, hash, count)` before the index's `max_occ` filter is
+    /// applied. It receives no catalog-sized retained collection, allowing a
+    /// native sidecar writer to consume the records as the builder's buckets
+    /// are consumed.
+    pub fn finish_with_occurrence_counts<F>(mut self, mut emit: F) -> Index
+    where
+        F: FnMut(u32, u64, u32),
+    {
+        self.sort_buckets();
+        for (bucket_id, bucket) in self.buckets.iter().enumerate() {
+            let mut i = 0usize;
+            while i < bucket.len() {
+                let hash = bucket[i].0;
+                let start = i;
+                while i < bucket.len() && bucket[i].0 == hash { i += 1; }
+                let count = u32::try_from(i - start).expect("minimizer occurrence count exceeds u32");
+                emit(bucket_id as u32, hash, count);
+            }
+        }
+        self.finish_index()
+    }
+
+    /// Finalize: sort buckets, build the per-bucket hash backend, attach to
+    /// the index, and return it.
+    pub fn finish(mut self) -> Index {
+        self.sort_buckets();
+        self.finish_index()
     }
 }
 
@@ -800,5 +832,22 @@ mod tests {
         // frac=0.5 -> finds count at 50th percentile
         let m05 = idx.cal_mid_occ(0.5, 10, 1000000);
         assert!(m05 >= 10, "frac=0.5 should be at least 10, got {}", m05); 
+    }
+
+    #[test]
+    fn builder_emits_pre_cap_occurrence_counts_without_retaining_records() {
+        let mut builder = IndexBuilder::new(1, 3, false, 1);
+        builder.add_sequence("repetitive".to_string(), vec![b'A'; 64]);
+        let mut counts = Vec::new();
+        let index = builder.finish_with_occurrence_counts(|bucket, hash, count| {
+            counts.push((bucket, hash, count));
+        });
+
+        assert!(!counts.is_empty());
+        assert!(counts.windows(2).all(|pair| {
+            (pair[0].0, pair[0].1) <= (pair[1].0, pair[1].1)
+        }));
+        assert!(counts.iter().any(|(_, _, count)| *count > 1));
+        assert!(index.get(counts[0].1).is_none() || counts[0].2 <= 1);
     }
 }
