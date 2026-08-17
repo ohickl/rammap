@@ -1629,6 +1629,16 @@ mod tests {
     }
 
     #[test]
+    fn test_strainxpress_sr_ava_config_does_not_construct_index() {
+        let (opt, output) = strainxpress_sr_ava_config(21, 11, false, 37).unwrap();
+        assert_eq!(opt.seeding.mid_occ, 37);
+        assert!(opt.flags.contains(AlignFlags::OUT_CIGAR));
+        assert!(output.do_cigar);
+        assert!(!output.output_sam);
+        assert!(strainxpress_sr_ava_config(15, 10, false, 37).is_err());
+    }
+
+    #[test]
     fn test_map_result_empty() {
         let result = MapResult { mappings: Vec::new() };
         assert!(result.mappings.is_empty());
