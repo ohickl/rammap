@@ -296,6 +296,36 @@ impl IndexBuilder {
 }
 
 impl Index {
+    /// Build an index by streaming FASTA/FASTQ records through the incremental
+    /// builder. When supplied, `emit_occurrence` receives each pre-cap
+    /// occurrence count in `(bucket, hash, count)` order before the index is
+    /// finalized. Raw sequence bytes are released after each record.
+    pub fn build_fasta_with_occurrence_counts<F>(
+        path: &str,
+        w: usize,
+        k: usize,
+        is_hpc: bool,
+        max_occ: usize,
+        emit_occurrence: F,
+    ) -> io::Result<Self>
+    where
+        F: FnMut(u32, u64, u32),
+    {
+        let mut builder = IndexBuilder::new(w, k, is_hpc, max_occ);
+        let mut reader = crate::fasta::open(path)?;
+        reader
+            .for_each_record(|record| {
+                let name = String::from_utf8_lossy(record.head)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                builder.add_sequence(name, record.seq.to_vec());
+            })
+            .map_err(io::Error::other)?;
+        Ok(builder.finish_with_occurrence_counts(emit_occurrence))
+    }
+
     /// Dense lexicographic ranking of the target names, computed once on first use and cached
     pub fn name_rank(&self) -> &NameRankData {
         self.name_rank.get_or_init(|| {
