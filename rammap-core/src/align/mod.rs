@@ -42,6 +42,7 @@ pub mod pair;
 pub mod pipeline;
 pub mod raw_spool;
 pub mod occurrence_sidecar;
+pub mod partition;
 pub mod seed;
 pub mod sketch;
 pub mod sort;
