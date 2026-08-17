@@ -1155,6 +1155,20 @@ pub struct ProcessedQuery {
     pub stats: AlignmentStats,
 }
 
+/// Alignment candidates produced before query-global filtering, parent
+/// assignment, secondary selection, and MAPQ calculation.
+///
+/// This is deliberately a native-only boundary. A partitioned mapper can
+/// serialize this state between shard mapping and global finalization without
+/// exposing one Python object per candidate. The existing monolithic path
+/// consumes it immediately through [`finalize_raw_query`].
+pub struct RawQuery {
+    pub results: Vec<AlnResult>,
+    pub recalc_infos: Vec<DpRecalcInfo>,
+    pub rep_len: i32,
+    pub stats: AlignmentStats,
+}
+
 /// Core alignment pipeline: map → align → filter → MAPQ.
 /// Returns ProcessedQuery suitable for output formatting.
 pub fn process_query(
@@ -1667,11 +1681,30 @@ fn process_query_core(
     out: &OutputConfig,
     map_result: MapResult,
 ) -> ProcessedQuery {
+    let raw = align_query_raw(opt, mi, qseq, ctx, map_ctx, junc_db, out, map_result);
+    finalize_raw_query(raw, opt, mi, out, qseq.len())
+}
+
+/// Produce aligned candidates without applying query-global decisions.
+///
+/// All operations before this function returns are local to the supplied
+/// index shard. The returned candidates must be merged with candidates from
+/// other shards before [`finalize_raw_query`] is called when exact partitioned
+/// mapping is used.
+pub(crate) fn align_query_raw(
+    opt: &MapOptions,
+    mi: &Index,
+    qseq: &[u8],
+    ctx: &mut AlignmentContext,
+    map_ctx: &mut MapContext,
+    junc_db: Option<&JunctionDb>,
+    out: &OutputConfig,
+    map_result: MapResult,
+) -> RawQuery {
     let mut regs = map_result.regs;
     let rep_len = map_result.rep_len;
     let mut stats = map_result.stats;
     let squeezed = map_result.squeezed;
-    let split_mode = out.split_mode;
     // Mark ALT contigs on chains before sorting
     let n_alt = mi.seqs.iter().filter(|s| s.is_alt).count();
     if n_alt > 0 {
@@ -1834,29 +1867,63 @@ fn process_query_core(
 
     stats.t_align = t_aln_start.elapsed();
 
-    // Post-alignment filtering
+    RawQuery { results, recalc_infos, rep_len: rep_len as i32, stats }
+}
+
+/// Apply all decisions that require the complete candidate set for one query.
+///
+/// This is the only native finalization entry point for both monolithic and
+/// future partitioned mapping. Keeping the filtering, parent, secondary, and
+/// MAPQ sequence in one function prevents a shard merge from acquiring a
+/// weaker semantic implementation.
+pub(crate) fn finalize_raw_query(
+    mut raw: RawQuery,
+    opt: &MapOptions,
+    mi: &Index,
+    out: &OutputConfig,
+    qlen: usize,
+) -> ProcessedQuery {
     if out.do_cigar {
-        filter_alignment_results(&mut results, Some(&mut recalc_infos), opt.chaining.min_cnt, opt.chaining.min_chain_score, opt.alignment.min_dp_max, opt.alignment.max_clip_ratio, qlen);
+        filter_alignment_results(
+            &mut raw.results,
+            Some(&mut raw.recalc_infos),
+            opt.chaining.min_cnt,
+            opt.chaining.min_chain_score,
+            opt.alignment.min_dp_max,
+            opt.alignment.max_clip_ratio,
+            qlen,
+        );
     }
 
-    // Parent assignment, secondary selection, dp_max ranking
-    let (results, parent_indices) = assign_parents_and_select(results, &recalc_infos, opt, mi, out, split_mode, qlen);
+    let (results, parent_indices) = assign_parents_and_select(
+        raw.results,
+        &raw.recalc_infos,
+        opt,
+        mi,
+        out,
+        out.split_mode,
+        qlen,
+    );
 
-    // Set SAM primary flag (first non-secondary result)
     let mut sam_pri = vec![false; results.len()];
-    {
-        let mut n_pri = 0;
-        for (i, r) in results.iter().enumerate() {
-            if !r.is_secondary {
-                n_pri += 1;
-                sam_pri[i] = n_pri == 1;
-            }
+    let mut n_pri = 0;
+    for (i, r) in results.iter().enumerate() {
+        if !r.is_secondary {
+            n_pri += 1;
+            sam_pri[i] = n_pri == 1;
         }
     }
 
-    let mapqs = compute_mapping_qualities(&results, &parent_indices, opt, rep_len as f32);
+    let mapqs = compute_mapping_qualities(&results, &parent_indices, opt, raw.rep_len as f32);
 
-    ProcessedQuery { results, mapqs, sam_pri, parent_indices, rep_len: rep_len as i32, stats }
+    ProcessedQuery {
+        results,
+        mapqs,
+        sam_pri,
+        parent_indices,
+        rep_len: raw.rep_len,
+        stats: raw.stats,
+    }
 }
 
 /// Re-run post-alignment filtering and MAPQ on merged results from split index.
@@ -2975,5 +3042,83 @@ mod tests {
         }
         assert!(output.contains("read1"), "Output should contain qname: {}", output);
         assert!(output.contains("ref1"), "Output should contain rname: {}", output);
+    }
+
+    #[test]
+    fn test_raw_then_shared_finalize_matches_monolithic_path() {
+        let seq = b"ACGTACGTACGTACGT";
+        let idx = Index::build(
+            vec![("ref1".to_string(), seq.to_vec())],
+            4,
+            3,
+            false,
+            50000,
+        );
+        let mut opt = MapOptions::default();
+        opt.chaining.min_cnt = 1;
+        opt.chaining.min_chain_score = 0;
+        opt.alignment.min_dp_max = 0;
+        let out_cfg = OutputConfig {
+            do_cigar: true,
+            do_cs: false,
+            cs_long: false,
+            do_md: false,
+            do_ds: false,
+            eqx: false,
+            output_sam: false,
+            rg_id: None,
+            split_mode: false,
+        };
+
+        let mut direct_map_ctx = MapContext::new();
+        let mut direct_aln_ctx = AlignmentContext::new();
+        let direct = process_query(
+            &opt,
+            &idx,
+            "read1",
+            seq,
+            &mut direct_aln_ctx,
+            &mut direct_map_ctx,
+            None,
+            &out_cfg,
+        );
+
+        let mut raw_map_ctx = MapContext::new();
+        let mut raw_aln_ctx = AlignmentContext::new();
+        let (regs, rep_len, stats, squeezed) =
+            map_query(&opt, &idx, "read1", seq, &mut raw_map_ctx);
+        let raw = align_query_raw(
+            &opt,
+            &idx,
+            seq,
+            &mut raw_aln_ctx,
+            &mut raw_map_ctx,
+            None,
+            &out_cfg,
+            MapResult {
+                regs,
+                rep_len,
+                stats,
+                squeezed,
+            },
+        );
+        let split = finalize_raw_query(raw, &opt, &idx, &out_cfg, seq.len());
+
+        assert_eq!(direct.results.len(), split.results.len());
+        assert_eq!(direct.mapqs, split.mapqs);
+        assert_eq!(direct.sam_pri, split.sam_pri);
+        assert_eq!(direct.parent_indices, split.parent_indices);
+        assert_eq!(direct.rep_len, split.rep_len);
+        for (left, right) in direct.results.iter().zip(split.results.iter()) {
+            assert_eq!(left.ref_id, right.ref_id);
+            assert_eq!(left.query_start, right.query_start);
+            assert_eq!(left.query_end, right.query_end);
+            assert_eq!(left.ref_start, right.ref_start);
+            assert_eq!(left.ref_end, right.ref_end);
+            assert_eq!(left.cigar_str, right.cigar_str);
+            assert_eq!(left.is_secondary, right.is_secondary);
+            assert_eq!(left.split, right.split);
+            assert_eq!(left.split_depth, right.split_depth);
+        }
     }
 }
