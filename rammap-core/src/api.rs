@@ -203,6 +203,58 @@ pub fn finalize_options(opt: &mut MapOptions, k: usize) {
     opt.chaining.chn_pen_skip = (opt.filtering.chain_skip_scale as f64 * 0.01 * k as f64) as f32;
 }
 
+/// Return the fixed StrainXpress short-read all-vs-all configuration without
+/// constructing an index.
+///
+/// Partitioned mapping uses this boundary when each target shard is opened
+/// independently. Keeping preset construction here prevents the binding from
+/// creating a dummy monolithic index merely to obtain options and output
+/// settings.
+pub fn strainxpress_sr_ava_config(
+    k: usize,
+    w: usize,
+    hpc: bool,
+    mid_occ: usize,
+) -> io::Result<(MapOptions, OutputConfig)> {
+    let mut preset_k = 15usize;
+    let mut preset_w = 10usize;
+    let mut preset_hpc = false;
+    let mut options = MapOptions::default();
+    apply_preset_str(
+        &mut options,
+        &mut preset_k,
+        &mut preset_w,
+        &mut preset_hpc,
+        Preset::StrainxpressSrAva.as_str(),
+    )
+    .expect("built-in preset must be recognized");
+    if k != preset_k || w != preset_w || hpc != preset_hpc {
+        return Err(invalid(
+            "StrainXpress short-read all-vs-all requires k=21, w=11, and hpc=false".to_string(),
+        ));
+    }
+    if mid_occ == 0 {
+        return Err(invalid("mid_occ must be positive".to_string()));
+    }
+    finalize_options(&mut options, k);
+    options.seeding.mid_occ = mid_occ;
+    options.flags.insert(AlignFlags::OUT_CIGAR);
+    Ok((
+        options,
+        OutputConfig {
+            do_cigar: true,
+            do_cs: false,
+            cs_long: false,
+            do_md: false,
+            do_ds: false,
+            eqx: false,
+            output_sam: false,
+            rg_id: None,
+            split_mode: false,
+        },
+    ))
+}
+
 /// Calibrate `seeding.mid_occ` against the index, unless it has already been
 /// set explicitly (by a preset or by the caller).
 pub fn calibrate_mid_occ(opt: &mut MapOptions, mi: &Index, mid_occ_frac: f32) {
