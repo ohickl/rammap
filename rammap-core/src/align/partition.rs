@@ -19,10 +19,19 @@ use crate::fasta;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, ErrorKind, Write};
+use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_CALIBRATION_BINS: usize = 16 * 1024 * 1024;
+const PARTITION_MANIFEST_MAGIC: &[u8; 4] = b"RXPM";
+const PARTITION_MANIFEST_VERSION: u32 = 1;
+const STAGE_INIT: u8 = 0;
+const STAGE_SIDECARS: u8 = 1;
+const STAGE_RAW: u8 = 2;
+const STAGE_OUTPUT_READY: u8 = 3;
+const STAGE_COMPLETE: u8 = 4;
+const FNV_OFFSET: u64 = 14695981039346656037;
+const FNV_PRIME: u64 = 1099511628211;
 
 /// Inputs and immutable parameters for one native partitioned run.
 pub struct PartitionedMapConfig {
@@ -40,6 +49,7 @@ pub struct PartitionedMapConfig {
     pub parameter_digest: [u8; 32],
     pub target_digest: [u8; 32],
     pub query_digest: [u8; 32],
+    pub resume: bool,
 }
 
 /// Durable-output facts returned by a completed partitioned operation.
@@ -53,6 +63,14 @@ pub struct PartitionedMapReceipt {
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidInput, message.into())
+}
+
+fn checksum_update(mut state: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        state ^= byte as u64;
+        state = state.wrapping_mul(FNV_PRIME);
+    }
+    state
 }
 
 fn create_new(path: &Path) -> io::Result<File> {
@@ -97,6 +115,163 @@ fn raw_path(config: &PartitionedMapConfig, shard_id: u32) -> PathBuf {
     config.spool_dir.join(format!("raw-{shard_id:08}.rxrs"))
 }
 
+fn partial_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.partial", path.display()))
+}
+
+fn manifest_path(config: &PartitionedMapConfig) -> PathBuf {
+    config.spool_dir.join("partitioned.manifest")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PartitionManifest {
+    shard_count: u32,
+    parameter_digest: [u8; 32],
+    target_digest: [u8; 32],
+    query_digest: [u8; 32],
+    stage: u8,
+    mid_occ: u64,
+    query_count: u64,
+    completed_raw: u32,
+    output_bytes: u64,
+    output_checksum: u64,
+}
+
+impl PartitionManifest {
+    fn initial(config: &PartitionedMapConfig, shard_count: u32) -> Self {
+        Self {
+            shard_count,
+            parameter_digest: config.parameter_digest,
+            target_digest: config.target_digest,
+            query_digest: config.query_digest,
+            stage: STAGE_INIT,
+            mid_occ: 0,
+            query_count: 0,
+            completed_raw: 0,
+            output_bytes: 0,
+            output_checksum: 0,
+        }
+    }
+
+    fn validate_config(&self, config: &PartitionedMapConfig, shard_count: u32) -> io::Result<()> {
+        if self.shard_count != shard_count
+            || self.parameter_digest != config.parameter_digest
+            || self.target_digest != config.target_digest
+            || self.query_digest != config.query_digest
+        {
+            return Err(invalid("partitioned resume manifest identity mismatch"));
+        }
+        if self.stage > STAGE_COMPLETE || self.completed_raw > shard_count {
+            return Err(invalid("partitioned resume manifest stage is invalid"));
+        }
+        if self.stage >= STAGE_SIDECARS && self.mid_occ == 0 {
+            return Err(invalid("partitioned resume manifest has no mid_occ"));
+        }
+        if self.stage >= STAGE_RAW && self.completed_raw != shard_count {
+            return Err(invalid("partitioned resume manifest raw stage is incomplete"));
+        }
+        if self.stage >= STAGE_OUTPUT_READY && self.output_checksum == 0 {
+            return Err(invalid("partitioned resume manifest output facts are invalid"));
+        }
+        Ok(())
+    }
+}
+
+fn encode_manifest(manifest: PartitionManifest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(160);
+    bytes.extend_from_slice(PARTITION_MANIFEST_MAGIC);
+    bytes.extend_from_slice(&PARTITION_MANIFEST_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&manifest.shard_count.to_le_bytes());
+    bytes.push(manifest.stage);
+    bytes.extend_from_slice(&manifest.parameter_digest);
+    bytes.extend_from_slice(&manifest.target_digest);
+    bytes.extend_from_slice(&manifest.query_digest);
+    bytes.extend_from_slice(&manifest.mid_occ.to_le_bytes());
+    bytes.extend_from_slice(&manifest.query_count.to_le_bytes());
+    bytes.extend_from_slice(&manifest.completed_raw.to_le_bytes());
+    bytes.extend_from_slice(&manifest.output_bytes.to_le_bytes());
+    bytes.extend_from_slice(&manifest.output_checksum.to_le_bytes());
+    let checksum = checksum_update(FNV_OFFSET, &bytes);
+    bytes.extend_from_slice(&checksum.to_le_bytes());
+    bytes
+}
+
+fn take_bytes<'a>(bytes: &'a [u8], offset: &mut usize, count: usize) -> io::Result<&'a [u8]> {
+    let end = offset
+        .checked_add(count)
+        .ok_or_else(|| invalid("partitioned manifest length overflow"))?;
+    if end > bytes.len() {
+        return Err(invalid("partitioned resume manifest is truncated"));
+    }
+    let value = &bytes[*offset..end];
+    *offset = end;
+    Ok(value)
+}
+
+fn take_u32(bytes: &[u8], offset: &mut usize) -> io::Result<u32> {
+    Ok(u32::from_le_bytes(take_bytes(bytes, offset, 4)?.try_into().unwrap()))
+}
+
+fn take_u64(bytes: &[u8], offset: &mut usize) -> io::Result<u64> {
+    Ok(u64::from_le_bytes(take_bytes(bytes, offset, 8)?.try_into().unwrap()))
+}
+
+fn load_manifest(path: &Path) -> io::Result<PartitionManifest> {
+    let bytes = fs::read(path)?;
+    if bytes.len() < 8 || &bytes[..4] != PARTITION_MANIFEST_MAGIC {
+        return Err(invalid("partitioned resume manifest magic is invalid"));
+    }
+    let expected_checksum = u64::from_le_bytes(
+        bytes[bytes.len() - 8..]
+            .try_into()
+            .map_err(|_| invalid("partitioned resume manifest checksum is truncated"))?,
+    );
+    if checksum_update(FNV_OFFSET, &bytes[..bytes.len() - 8]) != expected_checksum {
+        return Err(invalid("partitioned resume manifest checksum mismatch"));
+    }
+    let mut offset = 4;
+    if take_u32(&bytes, &mut offset)? != PARTITION_MANIFEST_VERSION {
+        return Err(invalid("partitioned resume manifest version is unsupported"));
+    }
+    let shard_count = take_u32(&bytes, &mut offset)?;
+    let stage = take_bytes(&bytes, &mut offset, 1)?[0];
+    let parameter_digest = take_bytes(&bytes, &mut offset, 32)?.try_into().unwrap();
+    let target_digest = take_bytes(&bytes, &mut offset, 32)?.try_into().unwrap();
+    let query_digest = take_bytes(&bytes, &mut offset, 32)?.try_into().unwrap();
+    let mid_occ = take_u64(&bytes, &mut offset)?;
+    let query_count = take_u64(&bytes, &mut offset)?;
+    let completed_raw = take_u32(&bytes, &mut offset)?;
+    let output_bytes = take_u64(&bytes, &mut offset)?;
+    let output_checksum = take_u64(&bytes, &mut offset)?;
+    if offset != bytes.len() - 8 {
+        return Err(invalid("partitioned resume manifest has trailing fields"));
+    }
+    Ok(PartitionManifest {
+        shard_count,
+        parameter_digest,
+        target_digest,
+        query_digest,
+        stage,
+        mid_occ,
+        query_count,
+        completed_raw,
+        output_bytes,
+        output_checksum,
+    })
+}
+
+fn write_manifest(path: &Path, manifest: PartitionManifest) -> io::Result<()> {
+    let temporary = partial_path(path);
+    if temporary.exists() {
+        return Err(invalid("partitioned resume manifest has an uncommitted temporary file"));
+    }
+    let mut file = create_new(&temporary)?;
+    file.write_all(&encode_manifest(manifest))?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn validate_config(config: &PartitionedMapConfig) -> io::Result<()> {
     if config.target_paths.is_empty() {
         return Err(invalid(
@@ -132,7 +307,14 @@ fn build_occurrence_sidecars(
 
     for (shard_id, target_path) in config.target_paths.iter().enumerate() {
         let sidecar = sidecar_path(config, shard_id as u32);
-        let file = create_new(&sidecar)?;
+        if sidecar.exists() {
+            return Err(invalid("partitioned occurrence sidecar exists before its manifest stage"));
+        }
+        let temporary = partial_path(&sidecar);
+        if temporary.exists() {
+            fs::remove_file(&temporary)?;
+        }
+        let file = create_new(&temporary)?;
         let mut writer = OccurrenceSidecarWriter::new(
             BufWriter::new(file),
             occurrence_metadata(config, shard_id as u32, shard_count),
@@ -166,6 +348,7 @@ fn build_occurrence_sidecars(
             .into_inner()
             .map_err(|error| io::Error::other(error.to_string()))?
             .sync_all()?;
+        fs::rename(temporary, sidecar)?;
 
         offsets.push(next_ref_id);
         for mut seq in index.seqs.iter().cloned() {
@@ -183,6 +366,88 @@ fn build_occurrence_sidecars(
             .ok_or_else(|| invalid("target length overflow"))?;
     }
     Ok((all_seqs, offsets))
+}
+
+fn read_target_metadata(config: &PartitionedMapConfig) -> io::Result<(Vec<TargetSequence>, Vec<usize>)> {
+    let mut all_seqs = Vec::new();
+    let mut offsets = Vec::with_capacity(config.target_paths.len());
+    let mut next_ref_id = 0usize;
+    let mut next_offset = 0u64;
+    for target_path in &config.target_paths {
+        let mut reader = fasta::open(
+            target_path
+                .to_str()
+                .ok_or_else(|| invalid("target path is not UTF-8"))?,
+        )?;
+        offsets.push(next_ref_id);
+        while let Some(record) = reader.read_next().map_err(io::Error::other)? {
+            let name = record
+                .name()
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let len = record.sequence().len();
+            all_seqs.push(TargetSequence {
+                name,
+                len,
+                offset: next_offset,
+                is_alt: false,
+            });
+            next_ref_id = next_ref_id
+                .checked_add(1)
+                .ok_or_else(|| invalid("target identifier overflow"))?;
+            next_offset = next_offset
+                .checked_add(len as u64)
+                .ok_or_else(|| invalid("target offset overflow"))?;
+        }
+    }
+    Ok((all_seqs, offsets))
+}
+
+fn validate_sidecars(config: &PartitionedMapConfig, shard_count: u32) -> io::Result<()> {
+    for shard_id in 0..shard_count {
+        let file = File::open(sidecar_path(config, shard_id))?;
+        let expected = occurrence_metadata(config, shard_id, shard_count);
+        OccurrenceSidecarReader::new(BufReader::new(file), Some(&expected))?.finish()?;
+    }
+    Ok(())
+}
+
+fn validate_raw_spool(
+    config: &PartitionedMapConfig,
+    shard_id: u32,
+    shard_count: u32,
+) -> io::Result<u64> {
+    let file = File::open(raw_path(config, shard_id))?;
+    let expected = raw_metadata(config, shard_id, shard_count);
+    let mut reader = RawSpoolReader::new(BufReader::new(file))?;
+    reader.validate_metadata(&expected)?;
+    let mut count = 0u64;
+    while reader.next_query()?.is_some() {
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| invalid("raw spool query count overflow"))?;
+    }
+    Ok(count)
+}
+
+fn output_stats(path: &Path) -> io::Result<(u64, u64)> {
+    let mut file = File::open(path)?;
+    let mut bytes = [0u8; 1024 * 1024];
+    let mut length = 0u64;
+    let mut checksum = FNV_OFFSET;
+    loop {
+        let count = file.read(&mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        length = length
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("partitioned output length overflow"))?;
+        checksum = checksum_update(checksum, &bytes[..count]);
+    }
+    Ok((length, checksum))
 }
 
 fn calibrated_mid_occ(config: &PartitionedMapConfig, sidecar_count: u32) -> io::Result<usize> {
@@ -284,7 +549,15 @@ fn map_shard_to_raw(
     let mut options = config.options.clone();
     options.seeding.mid_occ = mid_occ;
     super::super::api::finalize_options(&mut options, config.k);
-    let file = create_new(&raw_path(config, shard_id))?;
+    let raw = raw_path(config, shard_id);
+    if raw.exists() {
+        return Err(invalid("partitioned raw spool exists before its manifest stage"));
+    }
+    let temporary = partial_path(&raw);
+    if temporary.exists() {
+        fs::remove_file(&temporary)?;
+    }
+    let file = create_new(&temporary)?;
     let mut writer = RawSpoolWriter::new(
         BufWriter::new(file),
         raw_metadata(config, shard_id, shard_count),
@@ -342,16 +615,17 @@ fn map_shard_to_raw(
         .into_inner()
         .map_err(|error| io::Error::other(error.to_string()))?
         .sync_all()?;
+    fs::rename(temporary, raw)?;
     Ok(ordinal)
 }
 
-fn merge_and_publish(
+fn merge_to_partial(
     config: &PartitionedMapConfig,
     all_seqs: Vec<TargetSequence>,
     ref_offsets: &[usize],
     shard_count: u32,
     mid_occ: usize,
-) -> io::Result<u64> {
+) -> io::Result<(u64, u64, u64)> {
     let mut readers = Vec::with_capacity(shard_count as usize);
     for shard_id in 0..shard_count {
         let file = File::open(raw_path(config, shard_id))?;
@@ -453,13 +727,20 @@ fn merge_and_publish(
         .into_inner()
         .map_err(|error| io::Error::other(error.to_string()))?;
     file.sync_all()?;
+    let (output_bytes, output_checksum) = output_stats(&partial)?;
+    Ok((query_count, output_bytes, output_checksum))
+}
+
+fn publish_partial_output(config: &PartitionedMapConfig, expected: (u64, u64)) -> io::Result<()> {
     if config.output_path.exists() {
-        return Err(invalid(
-            "refusing to replace an existing partitioned output",
-        ));
+        return Err(invalid("refusing to replace an existing partitioned output"));
     }
-    fs::rename(&partial, &config.output_path)?;
-    Ok(query_count)
+    let temporary = partial_path(&config.output_path);
+    if output_stats(&temporary)? != expected {
+        return Err(invalid("partitioned temporary output facts do not match the manifest"));
+    }
+    fs::rename(temporary, &config.output_path)?;
+    Ok(())
 }
 
 /// Build occurrence sidecars, map each target shard once, and globally
@@ -471,11 +752,92 @@ pub fn map_partitioned_fasta_to_paf(
     fs::create_dir_all(&config.spool_dir)?;
     let shard_count =
         u32::try_from(config.target_paths.len()).map_err(|_| invalid("too many target shards"))?;
-    let (all_seqs, ref_offsets) = build_occurrence_sidecars(config)?;
-    let mid_occ = calibrated_mid_occ(config, shard_count)?;
+    let manifest_file = manifest_path(config);
+    let mut manifest = if config.resume {
+        if partial_path(&manifest_file).exists() {
+            return Err(invalid("partitioned resume manifest has an uncommitted temporary file"));
+        }
+        let manifest = load_manifest(&manifest_file)?;
+        manifest.validate_config(config, shard_count)?;
+        manifest
+    } else {
+        if manifest_file.exists()
+            || config.output_path.exists()
+            || partial_path(&config.output_path).exists()
+        {
+            return Err(invalid(
+                "partitioned mapping artifacts already exist; use resume to reopen them",
+            ));
+        }
+        let manifest = PartitionManifest::initial(config, shard_count);
+        write_manifest(&manifest_file, manifest)?;
+        manifest
+    };
+
+    if manifest.stage == STAGE_COMPLETE {
+        let observed = output_stats(&config.output_path)?;
+        if observed != (manifest.output_bytes, manifest.output_checksum) {
+            return Err(invalid("completed partitioned output does not match its manifest"));
+        }
+        return Ok(PartitionedMapReceipt {
+            shard_count,
+            query_count: manifest.query_count,
+            mid_occ: manifest.mid_occ as usize,
+            output_bytes: manifest.output_bytes,
+        });
+    }
+
+    if manifest.stage == STAGE_OUTPUT_READY {
+        let expected = (manifest.output_bytes, manifest.output_checksum);
+        if config.output_path.exists() {
+            if output_stats(&config.output_path)? != expected {
+                return Err(invalid("published partitioned output does not match its manifest"));
+            }
+        } else {
+            publish_partial_output(config, expected)?;
+        }
+        manifest.stage = STAGE_COMPLETE;
+        write_manifest(&manifest_file, manifest)?;
+        return Ok(PartitionedMapReceipt {
+            shard_count,
+            query_count: manifest.query_count,
+            mid_occ: manifest.mid_occ as usize,
+            output_bytes: manifest.output_bytes,
+        });
+    }
+
+    let (all_seqs, ref_offsets) = if manifest.stage >= STAGE_SIDECARS {
+        validate_sidecars(config, shard_count)?;
+        read_target_metadata(config)?
+    } else {
+        let metadata = build_occurrence_sidecars(config)?;
+        let mid_occ = calibrated_mid_occ(config, shard_count)?;
+        manifest.stage = STAGE_SIDECARS;
+        manifest.mid_occ = mid_occ as u64;
+        write_manifest(&manifest_file, manifest)?;
+        metadata
+    };
+    let mid_occ = usize::try_from(manifest.mid_occ)
+        .map_err(|_| invalid("partitioned resume mid_occ exceeds usize"))?;
     let mut expected_queries = None;
     for shard_id in 0..shard_count {
-        let query_count = map_shard_to_raw(config, shard_id, shard_count, mid_occ)?;
+        let query_count = if shard_id < manifest.completed_raw {
+            validate_raw_spool(config, shard_id, shard_count)?
+        } else if raw_path(config, shard_id).exists() {
+            // The raw spool may have been atomically committed immediately
+            // before a manifest update was interrupted. Validate it and
+            // advance the manifest rather than rebuilding an immutable stage.
+            validate_raw_spool(config, shard_id, shard_count)?
+        } else {
+            let query_count = map_shard_to_raw(config, shard_id, shard_count, mid_occ)?;
+            manifest.completed_raw = shard_id + 1;
+            manifest.query_count = query_count;
+            if manifest.completed_raw == shard_count {
+                manifest.stage = STAGE_RAW;
+            }
+            write_manifest(&manifest_file, manifest)?;
+            query_count
+        };
         if let Some(expected) = expected_queries {
             if expected != query_count {
                 return Err(invalid("shards observed different query counts"));
@@ -484,8 +846,29 @@ pub fn map_partitioned_fasta_to_paf(
             expected_queries = Some(query_count);
         }
     }
-    let query_count = merge_and_publish(config, all_seqs, &ref_offsets, shard_count, mid_occ)?;
-    let output_bytes = fs::metadata(&config.output_path)?.len();
+    if manifest.stage != STAGE_RAW {
+        return Err(invalid("partitioned raw stage did not complete"));
+    }
+    if config.output_path.exists() {
+        return Err(invalid("partitioned output exists before publication stage"));
+    }
+    let temporary_output = partial_path(&config.output_path);
+    if temporary_output.exists() {
+        if !config.resume {
+            return Err(invalid("partitioned output has an uncommitted temporary file"));
+        }
+        fs::remove_file(&temporary_output)?;
+    }
+    let (query_count, output_bytes, output_checksum) =
+        merge_to_partial(config, all_seqs, &ref_offsets, shard_count, mid_occ)?;
+    manifest.stage = STAGE_OUTPUT_READY;
+    manifest.query_count = query_count;
+    manifest.output_bytes = output_bytes;
+    manifest.output_checksum = output_checksum;
+    write_manifest(&manifest_file, manifest)?;
+    publish_partial_output(config, (output_bytes, output_checksum))?;
+    manifest.stage = STAGE_COMPLETE;
+    write_manifest(&manifest_file, manifest)?;
     Ok(PartitionedMapReceipt {
         shard_count,
         query_count,
@@ -641,12 +1024,67 @@ mod tests {
             parameter_digest: [1; 32],
             target_digest: [2; 32],
             query_digest: [3; 32],
+            resume: false,
         };
         let receipt = map_partitioned_fasta_to_output(&config).unwrap();
         assert_eq!(receipt.query_count, 2);
-        assert_eq!(std::fs::read_to_string(output).unwrap(), monolithic);
+        let fresh_output = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(fresh_output, monolithic);
         assert!(config.spool_dir.join("raw-00000000.rxrs").is_file());
         assert!(config.spool_dir.join("occurrence-00000001.rxoc").is_file());
+
+        // Reopen at the publication boundary: the output is durable as a
+        // temporary artifact and the manifest records the exact bytes before
+        // the final rename. Resume must publish the same bytes.
+        fs::rename(&output, partial_path(&output)).unwrap();
+        let mut resume_manifest = load_manifest(&manifest_path(&config)).unwrap();
+        resume_manifest.stage = STAGE_OUTPUT_READY;
+        write_manifest(&manifest_path(&config), resume_manifest).unwrap();
+        let mut resumed = config;
+        resumed.resume = true;
+        let resumed_receipt = map_partitioned_fasta_to_output(&resumed).unwrap();
+        assert_eq!(resumed_receipt, receipt);
+        assert_eq!(std::fs::read_to_string(output).unwrap(), fresh_output);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partitioned_resume_rejects_manifest_corruption() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.fa");
+        let query = root.join("query.fa");
+        fs::write(&target, b">target\nACGTACGTACGTACGTACGTACGT\n").unwrap();
+        fs::write(&query, b">query\nACGTACGTACGT\n").unwrap();
+        let mut options = MapOptions::default();
+        let mut config = PartitionedMapConfig {
+            target_paths: vec![target],
+            query_path: query,
+            output_path: root.join("output.paf"),
+            spool_dir: root.join("spool"),
+            k: 5,
+            w: 3,
+            is_hpc: false,
+            index_max_occ: 100,
+            mid_occ_frac: 2e-4,
+            options: {
+                finalize_options(&mut options, 5);
+                options
+            },
+            output: output_config(),
+            parameter_digest: [4; 32],
+            target_digest: [5; 32],
+            query_digest: [6; 32],
+            resume: false,
+        };
+        let _ = map_partitioned_fasta_to_output(&config).unwrap();
+        let manifest = manifest_path(&config);
+        let mut bytes = fs::read(&manifest).unwrap();
+        bytes[20] ^= 1;
+        fs::write(manifest, bytes).unwrap();
+        config.resume = true;
+        assert!(map_partitioned_fasta_to_output(&config).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }
