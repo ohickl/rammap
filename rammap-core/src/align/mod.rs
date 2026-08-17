@@ -40,6 +40,7 @@ pub mod junc;
 pub mod map;
 pub mod pair;
 pub mod pipeline;
+pub mod raw_spool;
 pub mod seed;
 pub mod sketch;
 pub mod sort;

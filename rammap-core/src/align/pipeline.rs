@@ -234,6 +234,7 @@ impl CigarStats {
 }
 
 // Stats needed for dp_max recalculation
+#[derive(Debug)]
 pub struct DpRecalcInfo {
     pub match_len: i32,
     pub block_len: i32,
@@ -359,7 +360,7 @@ pub fn update_dp_max(
 }
 
 // Alignment result struct - replaces the unwieldy 18-field tuple
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlnResult {
     // Mapping metadata (owned, so splits don't need references)
     pub ref_id: usize,
@@ -1162,6 +1163,7 @@ pub struct ProcessedQuery {
 /// serialize this state between shard mapping and global finalization without
 /// exposing one Python object per candidate. The existing monolithic path
 /// consumes it immediately through [`finalize_raw_query`].
+#[derive(Debug)]
 pub struct RawQuery {
     pub results: Vec<AlnResult>,
     pub recalc_infos: Vec<DpRecalcInfo>,
