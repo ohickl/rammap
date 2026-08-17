@@ -602,6 +602,9 @@ impl Aligner {
     /// Mutably access OutputConfig for toggling CIGAR/CS/MD/SAM defaults.
     pub fn output_config_mut(&mut self) -> &mut OutputConfig { &mut self.out_cfg }
 
+    /// Access the current output configuration for native orchestration.
+    pub fn output_config(&self) -> &OutputConfig { &self.out_cfg }
+
     // --- Internal ---
 
     fn resolve_out_cfg(&self, opts: &MapOpts) -> OutputConfig {
