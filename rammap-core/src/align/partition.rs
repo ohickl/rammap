@@ -274,13 +274,12 @@ fn map_shard_to_raw(
     let target_path = config.target_paths[shard_id as usize]
         .to_str()
         .ok_or_else(|| invalid("target path is not UTF-8"))?;
-    let index = Index::build_fasta_with_occurrence_counts(
+    let index = Index::build_fasta(
         target_path,
         config.w,
         config.k,
         config.is_hpc,
         config.index_max_occ,
-        |_, _, _| {},
     )?;
     let mut options = config.options.clone();
     options.seeding.mid_occ = mid_occ;

@@ -296,6 +296,32 @@ impl IndexBuilder {
 }
 
 impl Index {
+    /// Build an index by streaming FASTA/FASTQ records without retaining
+    /// occurrence-count callbacks. This is the mapping-path counterpart to
+    /// `build_fasta_with_occurrence_counts`; it avoids traversing every
+    /// pre-cap bucket a second time when calibration has already completed.
+    pub fn build_fasta(
+        path: &str,
+        w: usize,
+        k: usize,
+        is_hpc: bool,
+        max_occ: usize,
+    ) -> io::Result<Self> {
+        let mut builder = IndexBuilder::new(w, k, is_hpc, max_occ);
+        let mut reader = crate::fasta::open(path)?;
+        reader
+            .for_each_record(|record| {
+                let name = String::from_utf8_lossy(record.head)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                builder.add_sequence(name, record.seq.to_vec());
+            })
+            .map_err(io::Error::other)?;
+        Ok(builder.finish())
+    }
+
     /// Build an index by streaming FASTA/FASTQ records through the incremental
     /// builder. When supplied, `emit_occurrence` receives each pre-cap
     /// occurrence count in `(bucket, hash, count)` order before the index is
