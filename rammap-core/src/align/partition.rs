@@ -367,7 +367,7 @@ fn write_manifest(path: &Path, manifest: PartitionManifest) -> io::Result<()> {
     file.write_all(&encode_manifest(manifest))?;
     file.sync_all()?;
     fs::rename(temporary, path)?;
-    sync_parent(path)?;
+    sync_parent(&path)?;
     Ok(())
 }
 
@@ -411,8 +411,8 @@ fn write_index_artifact(
     file.write_all(&payload_bytes.to_le_bytes())?;
     file.write_all(&payload_checksum.to_le_bytes())?;
     file.sync_all()?;
-    fs::rename(temporary, path)?;
-    sync_parent(path)?;
+    fs::rename(temporary, &path)?;
+    sync_parent(&path)?;
     Ok(())
 }
 
@@ -566,7 +566,7 @@ fn build_occurrence_sidecars(config: &PartitionedMapConfig) -> io::Result<()> {
             .into_inner()
             .map_err(|error| io::Error::other(error.to_string()))?
             .sync_all()?;
-        fs::rename(temporary, sidecar)?;
+        fs::rename(temporary, &sidecar)?;
         sync_parent(&sidecar)?;
     }
     Ok(())
@@ -844,7 +844,7 @@ fn map_shard_to_raw(
         .into_inner()
         .map_err(|error| io::Error::other(error.to_string()))?
         .sync_all()?;
-    fs::rename(temporary, raw)?;
+    fs::rename(temporary, &raw)?;
     sync_parent(&raw)?;
     policy.ensure_valid()?;
     Ok((ordinal, target_metadata))
