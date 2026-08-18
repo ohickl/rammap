@@ -44,7 +44,7 @@ pub enum Preset {
     LrHqae,
     MapIclr,
     Sr,
-    StrainxpressSrAva,
+    StrainXpressSrAva,
     Splice,
     SpliceHq,
     SpliceSr,
@@ -67,7 +67,7 @@ impl Preset {
             Preset::LrHqae => "lr:hqae",
             Preset::MapIclr => "map-iclr",
             Preset::Sr => "sr",
-            Preset::StrainxpressSrAva => "strainxpress-sr-ava",
+            Preset::StrainXpressSrAva => "strainxpress-sr-ava",
             Preset::Splice => "splice",
             Preset::SpliceHq => "splice:hq",
             Preset::SpliceSr => "splice:sr",
@@ -225,7 +225,7 @@ pub fn strainxpress_sr_ava_config(
         &mut preset_k,
         &mut preset_w,
         &mut preset_hpc,
-        Preset::StrainxpressSrAva.as_str(),
+        Preset::StrainXpressSrAva.as_str(),
     )
     .expect("built-in preset must be recognized");
     if k != preset_k || w != preset_w || hpc != preset_hpc {
@@ -1583,7 +1583,7 @@ mod tests {
     fn test_preset_as_str_roundtrip() {
         let presets = [
             Preset::MapOnt, Preset::MapPb, Preset::MapHifi, Preset::Sr,
-            Preset::StrainxpressSrAva,
+            Preset::StrainXpressSrAva,
             Preset::Splice, Preset::Asm5, Preset::AvaOnt,
         ];
         for p in &presets {
